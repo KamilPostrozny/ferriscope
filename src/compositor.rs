@@ -31,7 +31,7 @@ use crate::{
 	delivery::{self, FrameReceiver, FrameSender, OfferOutcome},
 	error::{Error, Result},
 	frame::{Frame, FrameData, ReleaseGuard, ReleaseSender},
-	frame_clock::{self, FrameClockCorrection, FrameClockSender},
+	frame_clock::{self, FrameClockCommand, FrameClockSender},
 	seat::InputEvent,
 	shell::{Endpoints, serve},
 	sink::Sink,
@@ -171,7 +171,7 @@ impl Compositor {
 		let (frames_tx, frames_rx) = delivery::channel();
 		let (releases_tx, releases_rx) = ReleaseSender::channel();
 		let (input_tx, input_rx) = calloop::channel::channel::<InputEvent>();
-		let (frame_clock_tx, frame_clock_rx) = calloop::channel::channel::<FrameClockCorrection>();
+		let (frame_clock_tx, frame_clock_rx) = calloop::channel::channel::<FrameClockCommand>();
 		let frame_clock = FrameClockSender::new(frame_clock_tx, frame_clock::nominal_period(config.rate));
 		let (ready_tx, ready_rx) = mpsc::sync_channel::<Ready>(1);
 		let (signal_tx, signal_rx) = mpsc::sync_channel::<LoopSignal>(1);

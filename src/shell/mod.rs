@@ -69,7 +69,7 @@ use crate::{
 	error::{Error, Result},
 	focus::{FocusControl, FocusDirty, PointerCapture, WindowId},
 	frame::Release,
-	frame_clock::FrameClockCorrection,
+	frame_clock::FrameClockCommand,
 	hdr::ContentKind,
 	overlay::SteamAtoms,
 	seat::InputEvent,
@@ -276,7 +276,7 @@ pub struct FerriscopeState {
 	input: Option<calloop::channel::Channel<InputEvent>>,
 	/// Frame-clock corrections from the consumer; taken when the sources are
 	/// inserted.
-	frame_clock: Option<calloop::channel::Channel<FrameClockCorrection>>,
+	frame_clock: Option<calloop::channel::Channel<FrameClockCommand>>,
 	/// One-shot readiness handshake; taken when it fires.
 	ready: Option<std::sync::mpsc::SyncSender<Ready>>,
 	/// Wayland display name, mirrored into [`Ready`].
@@ -325,7 +325,7 @@ pub(crate) struct Endpoints {
 	/// Input events from the consumer.
 	pub input: calloop::channel::Channel<InputEvent>,
 	/// Frame-clock corrections from the consumer.
-	pub frame_clock: calloop::channel::Channel<FrameClockCorrection>,
+	pub frame_clock: calloop::channel::Channel<FrameClockCommand>,
 	/// One-shot ready signal.
 	pub ready: std::sync::mpsc::SyncSender<Ready>,
 	/// Hand-off point for the event loop's stop signal.
@@ -767,7 +767,10 @@ impl FerriscopeState {
 			event_loop
 				.handle()
 				.insert_source(frame_clock, |event, _, state: &mut Self| match event {
-					calloop::channel::Event::Msg(correction) => state.correct_frame_clock(correction),
+					calloop::channel::Event::Msg(command) => {
+						state.correct_frame_clock(command.correction);
+						command.acknowledge();
+					},
 					calloop::channel::Event::Closed => {},
 				})
 				.map_err(|e| Error::Config(format!("insert frame clock channel: {e:?}")))?;

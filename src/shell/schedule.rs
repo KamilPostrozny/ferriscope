@@ -194,6 +194,7 @@ impl Scheduler {
 	/// phase shift adds to any not yet applied, bounded to half the nominal
 	/// period in total.
 	pub(in crate::shell) fn correct(&mut self, correction: FrameClockCorrection, now: Instant) {
+		self.expire_correction(now);
 		// Refill at the period the tokens had so far.
 		self.tokens = self.tokens_at(now);
 		self.last_refill = now;
@@ -372,7 +373,7 @@ impl Scheduler {
 	/// snaps forward instead of bursting.
 	pub(in crate::shell) fn callbacks_sent(&mut self, now: Instant) {
 		self.expire_correction(now);
-		let max_step = MAX_PHASE_STEP.as_nanos() as i64;
+		let max_step = MAX_PHASE_STEP.min(self.interval / 2).as_nanos() as i64;
 		let step = self.pending_shift_ns.clamp(-max_step, max_step);
 		self.pending_shift_ns -= step;
 		let shift = Duration::from_nanos(step.unsigned_abs());

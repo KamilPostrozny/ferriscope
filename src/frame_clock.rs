@@ -10,6 +10,10 @@
 //! grid goes back to the nominal period, so a consumer that stops steering
 //! never leaves the session on stale timing.
 
+use std::sync::{
+	Arc,
+	atomic::{AtomicU32, Ordering},
+};
 use std::time::Duration;
 
 use smithay::reexports::calloop;
@@ -47,8 +51,8 @@ impl FrameClockCorrection {
 	/// Whether the correction is within its bounds for a session whose nominal
 	/// period is `nominal`.
 	pub fn check(&self, nominal: Duration) -> Result<()> {
-		let deviation = (self.period.as_secs_f64() - nominal.as_secs_f64()).abs();
-		if deviation > nominal.as_secs_f64() * MAX_PERIOD_DEVIATION {
+		let deviation = self.period.abs_diff(nominal);
+		if self.period.is_zero() || deviation > nominal / 100 {
 			return Err(Error::FrameClock(format!(
 				"period {:?} is more than {}% from the nominal {nominal:?}",
 				self.period,
@@ -77,13 +81,18 @@ pub(crate) fn max_phase_shift_ns(nominal: Duration) -> u64 {
 /// API.
 #[derive(Clone)]
 pub struct FrameClockSender {
-	sender: calloop::channel::Sender<FrameClockCorrection>,
+	sender: calloop::channel::Sender<FrameClockCommand>,
+	applied: Arc<AtomicU32>,
 	nominal: Duration,
 }
 
 impl FrameClockSender {
-	pub(crate) fn new(sender: calloop::channel::Sender<FrameClockCorrection>, nominal: Duration) -> Self {
-		Self { sender, nominal }
+	pub(crate) fn new(sender: calloop::channel::Sender<FrameClockCommand>, nominal: Duration) -> Self {
+		Self {
+			sender,
+			nominal,
+			applied: Arc::new(AtomicU32::new(0)),
+		}
 	}
 
 	/// The session's nominal period (`1 / rate`).
@@ -91,15 +100,37 @@ impl FrameClockSender {
 		self.nominal
 	}
 
+	/// The sequence last installed by the compositor thread (zero before any).
+	/// Queuing a correction does not acknowledge it.
+	pub fn last_applied(&self) -> u32 {
+		self.applied.load(Ordering::Acquire)
+	}
+
 	/// Apply a correction from the next frame callback on.
 	///
 	/// Fails, and changes nothing, when the correction is out of its bounds
 	/// ([`FrameClockCorrection::check`]) or the compositor has shut down.
-	pub fn send(&self, correction: FrameClockCorrection) -> Result<()> {
+	pub fn send(&self, sequence: u32, correction: FrameClockCorrection) -> Result<()> {
 		correction.check(self.nominal)?;
 		self.sender
-			.send(correction)
+			.send(FrameClockCommand {
+				correction,
+				sequence,
+				applied: Arc::clone(&self.applied),
+			})
 			.map_err(|_| Error::FrameClock("frame clock channel closed".into()))
+	}
+}
+
+pub(crate) struct FrameClockCommand {
+	pub correction: FrameClockCorrection,
+	sequence: u32,
+	applied: Arc<AtomicU32>,
+}
+
+impl FrameClockCommand {
+	pub(crate) fn acknowledge(self) {
+		self.applied.store(self.sequence, Ordering::Release);
 	}
 }
 
@@ -115,7 +146,7 @@ mod tests {
 
 	const NOMINAL: Duration = Duration::from_millis(10);
 
-	fn sender() -> (FrameClockSender, calloop::channel::Channel<FrameClockCorrection>) {
+	fn sender() -> (FrameClockSender, calloop::channel::Channel<FrameClockCommand>) {
 		let (tx, rx) = calloop::channel::channel();
 		(FrameClockSender::new(tx, NOMINAL), rx)
 	}
@@ -127,7 +158,7 @@ mod tests {
 		}
 	}
 
-	fn sent(rx: &calloop::channel::Channel<FrameClockCorrection>) -> Vec<FrameClockCorrection> {
+	fn sent(rx: &calloop::channel::Channel<FrameClockCommand>) -> Vec<FrameClockCommand> {
 		std::iter::from_fn(|| rx.try_recv().ok()).collect()
 	}
 
@@ -140,7 +171,7 @@ mod tests {
 			correction(10_100, 5_000),
 			correction(9_900, -5_000),
 		] {
-			sender.send(within).expect("within the bounds");
+			sender.send(1, within).expect("within the bounds");
 		}
 		assert_eq!(sent(&rx).len(), 3);
 	}
@@ -156,7 +187,7 @@ mod tests {
 			correction(0, 0),
 		] {
 			assert!(
-				matches!(sender.send(outside), Err(Error::FrameClock(_))),
+				matches!(sender.send(1, outside), Err(Error::FrameClock(_))),
 				"{outside:?} must be refused"
 			);
 		}
@@ -167,6 +198,18 @@ mod tests {
 	fn a_correction_to_a_stopped_compositor_fails() {
 		let (sender, rx) = sender();
 		drop(rx);
-		assert!(matches!(sender.send(correction(10_000, 0)), Err(Error::FrameClock(_))));
+		assert!(matches!(
+			sender.send(1, correction(10_000, 0)),
+			Err(Error::FrameClock(_))
+		));
+	}
+
+	#[test]
+	fn a_queued_correction_is_not_acknowledged_until_installed() {
+		let (sender, rx) = sender();
+		sender.send(7, correction(10_000, 100)).unwrap();
+		assert_eq!(sender.last_applied(), 0);
+		rx.try_recv().unwrap().acknowledge();
+		assert_eq!(sender.last_applied(), 7);
 	}
 }
