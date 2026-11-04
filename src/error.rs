@@ -52,4 +52,10 @@ pub enum Error {
 	/// A frame could not be delivered to the sink.
 	#[error("sink: {0}")]
 	Sink(String),
+
+	// --- frame clock ------------------------------------------------------
+	/// A frame-clock correction was out of its bounds, or the compositor has
+	/// shut down.
+	#[error("frame clock: {0}")]
+	FrameClock(String),
 }

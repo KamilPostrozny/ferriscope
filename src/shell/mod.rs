@@ -69,6 +69,7 @@ use crate::{
 	error::{Error, Result},
 	focus::{FocusControl, FocusDirty, PointerCapture, WindowId},
 	frame::Release,
+	frame_clock::FrameClockCorrection,
 	hdr::ContentKind,
 	overlay::SteamAtoms,
 	seat::InputEvent,
@@ -273,6 +274,9 @@ pub struct FerriscopeState {
 	releases: Option<calloop::channel::Channel<Release>>,
 	/// Input from the consumer; taken when the sources are inserted.
 	input: Option<calloop::channel::Channel<InputEvent>>,
+	/// Frame-clock corrections from the consumer; taken when the sources are
+	/// inserted.
+	frame_clock: Option<calloop::channel::Channel<FrameClockCorrection>>,
 	/// One-shot readiness handshake; taken when it fires.
 	ready: Option<std::sync::mpsc::SyncSender<Ready>>,
 	/// Wayland display name, mirrored into [`Ready`].
@@ -320,6 +324,8 @@ pub(crate) struct Endpoints {
 	pub releases: calloop::channel::Channel<Release>,
 	/// Input events from the consumer.
 	pub input: calloop::channel::Channel<InputEvent>,
+	/// Frame-clock corrections from the consumer.
+	pub frame_clock: calloop::channel::Channel<FrameClockCorrection>,
 	/// One-shot ready signal.
 	pub ready: std::sync::mpsc::SyncSender<Ready>,
 	/// Hand-off point for the event loop's stop signal.
@@ -381,6 +387,7 @@ impl FerriscopeState {
 			sink,
 			releases,
 			input,
+			frame_clock,
 			ready,
 			signal: _,
 			stop,
@@ -624,6 +631,7 @@ impl FerriscopeState {
 			control,
 			releases: Some(releases),
 			input: Some(input),
+			frame_clock: Some(frame_clock),
 			ready: Some(ready),
 			wayland_display,
 			hdr: config_hdr,
@@ -752,6 +760,17 @@ impl FerriscopeState {
 					calloop::channel::Event::Closed => {},
 				})
 				.map_err(|e| Error::Input(format!("insert input channel: {e:?}")))?;
+		}
+
+		// The consumer steers the frame-callback grid (see `crate::frame_clock`).
+		if let Some(frame_clock) = self.frame_clock.take() {
+			event_loop
+				.handle()
+				.insert_source(frame_clock, |event, _, state: &mut Self| match event {
+					calloop::channel::Event::Msg(correction) => state.correct_frame_clock(correction),
+					calloop::channel::Event::Closed => {},
+				})
+				.map_err(|e| Error::Config(format!("insert frame clock channel: {e:?}")))?;
 		}
 
 		Ok(())

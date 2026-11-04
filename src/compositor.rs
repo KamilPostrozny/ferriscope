@@ -31,6 +31,7 @@ use crate::{
 	delivery::{self, FrameReceiver, FrameSender, OfferOutcome},
 	error::{Error, Result},
 	frame::{Frame, FrameData, ReleaseGuard, ReleaseSender},
+	frame_clock::{self, FrameClockCorrection, FrameClockSender},
 	seat::InputEvent,
 	shell::{Endpoints, serve},
 	sink::Sink,
@@ -103,6 +104,8 @@ pub struct CompositorHandles {
 	pub frames: FrameReceiver,
 	/// Inject keyboard/pointer events into the compositor's seat.
 	pub input: InputSender,
+	/// Steer the session's frame clock (see [`crate::FrameClockCorrection`]).
+	pub frame_clock: FrameClockSender,
 	/// One-shot readiness handshake; fires after the socket is live.
 	pub ready: Receiver<Ready>,
 }
@@ -168,6 +171,8 @@ impl Compositor {
 		let (frames_tx, frames_rx) = delivery::channel();
 		let (releases_tx, releases_rx) = ReleaseSender::channel();
 		let (input_tx, input_rx) = calloop::channel::channel::<InputEvent>();
+		let (frame_clock_tx, frame_clock_rx) = calloop::channel::channel::<FrameClockCorrection>();
+		let frame_clock = FrameClockSender::new(frame_clock_tx, frame_clock::nominal_period(config.rate));
 		let (ready_tx, ready_rx) = mpsc::sync_channel::<Ready>(1);
 		let (signal_tx, signal_rx) = mpsc::sync_channel::<LoopSignal>(1);
 		let stop = Arc::new(AtomicBool::new(false));
@@ -186,6 +191,7 @@ impl Compositor {
 					sink,
 					releases: releases_rx,
 					input: input_rx,
+					frame_clock: frame_clock_rx,
 					ready: ready_tx,
 					signal: signal_tx,
 					stop: thread_stop,
@@ -222,6 +228,7 @@ impl Compositor {
 			CompositorHandles {
 				frames: frames_rx,
 				input: InputSender(input_tx),
+				frame_clock,
 				ready: ready_rx,
 			},
 		))

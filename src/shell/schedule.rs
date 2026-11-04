@@ -36,7 +36,10 @@ use smithay::{
 	utils::IsAlive,
 };
 
-use crate::shell::{FerriscopeState, render::RenderOutcome};
+use crate::{
+	frame_clock::{CORRECTION_TIMEOUT, FrameClockCorrection, MAX_PHASE_STEP, max_phase_shift_ns, nominal_period},
+	shell::{FerriscopeState, render::RenderOutcome},
+};
 
 /// How long a static screen is re-composited as a keepalive.
 ///
@@ -92,8 +95,18 @@ const TOKEN_EPSILON: f64 = 1e-6;
 /// next frame callbacks are due.
 #[derive(Debug)]
 pub(in crate::shell) struct Scheduler {
-	/// The session interval (`1 / rate`).
+	/// The session interval: the frame clock's period, `1 / rate` unless an
+	/// embedder's correction set it.
 	interval: Duration,
+	/// The nominal interval (`1 / rate`), which the clock goes back to when
+	/// corrections stop.
+	nominal: Duration,
+	/// Phase shift still to apply to the frame-callback grid, in nanoseconds
+	/// (positive: later); at most [`MAX_PHASE_STEP`] per callback.
+	pending_shift_ns: i64,
+	/// When the last frame-clock correction arrived; `None` while the clock
+	/// runs at its nominal period.
+	last_correction: Option<Instant>,
 	/// Monotonic count of surface commits observed; folded into the scene
 	/// signature so any client commit is a change.
 	commit_epoch: u64,
@@ -146,10 +159,12 @@ pub(in crate::shell) struct Delivery {
 impl Scheduler {
 	/// A scheduler for a session at `rate` Hz, starting at `now`.
 	pub(in crate::shell) fn new(rate: f64, now: Instant) -> Self {
-		let rate = if rate.is_finite() { rate.max(1.0) } else { 60.0 };
-		let interval = Duration::from_secs_f64(1.0 / rate);
+		let interval = nominal_period(rate);
 		Self {
 			interval,
+			nominal: interval,
+			pending_shift_ns: 0,
+			last_correction: None,
 			commit_epoch: 0,
 			last_scene: None,
 			last_frame_at: now,
@@ -167,9 +182,48 @@ impl Scheduler {
 		}
 	}
 
-	/// The session interval (`1 / rate`).
+	/// The session interval: the frame clock's current period.
 	pub(in crate::shell) fn interval(&self) -> Duration {
 		self.interval
+	}
+
+	/// Apply an embedder's frame-clock correction at `now` (already checked
+	/// against its bounds by [`crate::FrameClockSender`]).
+	///
+	/// The period holds from the next callback after the one already armed; the
+	/// phase shift adds to any not yet applied, bounded to half the nominal
+	/// period in total.
+	pub(in crate::shell) fn correct(&mut self, correction: FrameClockCorrection, now: Instant) {
+		// Refill at the period the tokens had so far.
+		self.tokens = self.tokens_at(now);
+		self.last_refill = now;
+		self.interval = correction.period;
+		let bound = max_phase_shift_ns(self.nominal) as i64;
+		self.pending_shift_ns = self
+			.pending_shift_ns
+			.saturating_add(correction.phase_shift_ns)
+			.clamp(-bound, bound);
+		self.last_correction = Some(now);
+	}
+
+	/// Whether an embedder's correction steers the frame clock.
+	pub(in crate::shell) fn steered(&self) -> bool {
+		self.last_correction.is_some()
+	}
+
+	/// Go back to the nominal period, dropping any phase shift not yet applied,
+	/// once no correction has arrived for [`CORRECTION_TIMEOUT`].
+	fn expire_correction(&mut self, now: Instant) {
+		if self
+			.last_correction
+			.is_some_and(|at| now.saturating_duration_since(at) >= CORRECTION_TIMEOUT)
+		{
+			self.tokens = self.tokens_at(now);
+			self.last_refill = now;
+			self.interval = self.nominal;
+			self.pending_shift_ns = 0;
+			self.last_correction = None;
+		}
 	}
 
 	/// Record one surface commit.
@@ -313,10 +367,20 @@ impl Scheduler {
 	/// Record that frame callbacks went out at `now`.
 	///
 	/// The target advances by one interval from its previous value rather than
-	/// from `now`, so the cadence does not drift by the dispatch latency; if the
-	/// loop overran, it snaps forward instead of bursting.
+	/// from `now`, so the cadence does not drift by the dispatch latency, plus at
+	/// most [`MAX_PHASE_STEP`] of a pending phase shift; if the loop overran, it
+	/// snaps forward instead of bursting.
 	pub(in crate::shell) fn callbacks_sent(&mut self, now: Instant) {
-		self.next_callback += self.interval;
+		self.expire_correction(now);
+		let max_step = MAX_PHASE_STEP.as_nanos() as i64;
+		let step = self.pending_shift_ns.clamp(-max_step, max_step);
+		self.pending_shift_ns -= step;
+		let shift = Duration::from_nanos(step.unsigned_abs());
+		self.next_callback = if step >= 0 {
+			self.next_callback + self.interval + shift
+		} else {
+			self.next_callback + (self.interval - shift)
+		};
 		if self.next_callback <= now {
 			self.next_callback = now + self.interval;
 		}
@@ -445,6 +509,23 @@ impl FerriscopeState {
 		}
 	}
 
+	/// The consumer corrected the frame clock (see [`crate::frame_clock`]).
+	pub(in crate::shell) fn correct_frame_clock(&mut self, correction: FrameClockCorrection) {
+		if !self.scheduler.steered() {
+			tracing::info!(
+				period_ns = correction.period.as_nanos() as u64,
+				"frame clock: steered by the consumer"
+			);
+		}
+		tracing::trace!(
+			target: "ferriscope::latency",
+			period_ns = correction.period.as_nanos() as u64,
+			phase_shift_ns = correction.phase_shift_ns,
+			"frame clock correction"
+		);
+		self.scheduler.correct(correction, Instant::now());
+	}
+
 	/// The timer fired: the housekeeping and frame callbacks that run at the
 	/// session rate.
 	fn on_timer(&mut self) {
@@ -452,7 +533,11 @@ impl FerriscopeState {
 		if !self.scheduler.callbacks_due(now) {
 			return;
 		}
+		let steered = self.scheduler.steered();
 		self.scheduler.callbacks_sent(now);
+		if steered && !self.scheduler.steered() {
+			tracing::info!("frame clock: no correction for {CORRECTION_TIMEOUT:?}; back to the nominal period");
+		}
 
 		self.space.refresh();
 		self.popups.cleanup();
@@ -934,5 +1019,130 @@ mod tests {
 		assert_eq!(second.commit_to_delivery, None);
 		assert_eq!(second.since_last, Some(ms(17)));
 		assert!(second.repeat);
+	}
+
+	fn correction(period: Duration, phase_shift_us: i64) -> FrameClockCorrection {
+		FrameClockCorrection {
+			period,
+			phase_shift_ns: phase_shift_us * 1000,
+		}
+	}
+
+	/// Run the frame-callback tick from `from` to `until`, sending callbacks the
+	/// moment they are due, with a client that commits on each one and is
+	/// delivered on commit. Returns the commit times.
+	fn commits_on_the_tick(s: &mut Scheduler, from: Instant, until: Instant) -> Vec<Instant> {
+		let mut commits = Vec::new();
+		let mut scene = s.commit_epoch() + 1000;
+		let mut now = from;
+		loop {
+			now = now.max(s.next_deadline(None, true, now));
+			if now > until {
+				return commits;
+			}
+			assert!(s.callbacks_due(now));
+			s.callbacks_sent(now);
+			s.commit(now);
+			scene += 1;
+			s.observe(scene, now);
+			assert!(
+				s.should_render(scene, true, now),
+				"a tick-paced client is delivered on commit"
+			);
+			s.delivered(scene, now);
+			commits.push(now);
+		}
+	}
+
+	fn spacings_us(times: &[Instant]) -> Vec<u64> {
+		times
+			.windows(2)
+			.map(|pair| (pair[1] - pair[0]).as_micros() as u64)
+			.collect()
+	}
+
+	#[test]
+	fn the_clock_follows_a_corrected_period() {
+		let (mut s, t0) = scheduler();
+		s.correct(correction(Duration::from_micros(10_050), 0), t0);
+		let commits = commits_on_the_tick(&mut s, t0, t0 + ms(100));
+		assert_eq!(s.interval(), Duration::from_micros(10_050));
+		// The tick already armed keeps its time; every one after is 10.05 ms on.
+		assert_eq!(commits[0], t0 + INTERVAL);
+		assert!(
+			spacings_us(&commits).iter().all(|spacing| *spacing == 10_050),
+			"{:?}",
+			spacings_us(&commits)
+		);
+	}
+
+	#[test]
+	fn a_phase_shift_moves_the_next_frames_commit_times() {
+		let (mut s, t0) = scheduler();
+		let before = commits_on_the_tick(&mut s, t0, t0 + ms(30));
+		let now = *before.last().unwrap();
+		// 600 us later, applied at most 250 us per frame from the tick after the
+		// one already armed.
+		s.correct(correction(INTERVAL, 600), now);
+		let later = commits_on_the_tick(&mut s, now, now + ms(60));
+		assert_eq!(later[0], now + INTERVAL);
+		assert_eq!(spacings_us(&later[..5]), [10_250, 10_250, 10_100, 10_000]);
+		// And earlier: 300 us.
+		let now = *later.last().unwrap();
+		s.correct(correction(INTERVAL, -300), now);
+		let earlier = commits_on_the_tick(&mut s, now, now + ms(40));
+		assert_eq!(earlier[0], now + INTERVAL);
+		assert_eq!(spacings_us(&earlier[..4]), [9_750, 9_950, 10_000]);
+	}
+
+	#[test]
+	fn shifts_waiting_to_be_applied_add_up_to_at_most_half_a_period() {
+		let (mut s, t0) = scheduler();
+		// Two 4 ms shifts: 8 ms waiting, bounded to 5 ms.
+		s.correct(correction(INTERVAL, 4_000), t0);
+		s.correct(correction(INTERVAL, 4_000), t0);
+		let commits = commits_on_the_tick(&mut s, t0, t0 + ms(400));
+		let last = *commits.last().unwrap();
+		let n = commits.len() as u32;
+		assert_eq!(last, t0 + INTERVAL * n + ms(5));
+	}
+
+	#[test]
+	fn with_no_correction_before_the_timeout_the_clock_goes_back_to_nominal() {
+		let (mut s, t0) = scheduler();
+		let steered = Duration::from_micros(10_080);
+		s.correct(correction(steered, 5_000), t0);
+		assert!(s.steered());
+		// A correction just before the timeout keeps the clock steered.
+		commits_on_the_tick(&mut s, t0, t0 + ms(900));
+		s.correct(correction(steered, 0), t0 + ms(900));
+		commits_on_the_tick(&mut s, t0 + ms(900), t0 + ms(1_800));
+		assert!(s.steered());
+		assert_eq!(s.interval(), steered);
+		// Then nothing: from one timeout after the last correction, the nominal
+		// period.
+		s.correct(correction(steered, 0), t0 + ms(1_800));
+		let commits = commits_on_the_tick(&mut s, t0 + ms(1_800), t0 + ms(4_000));
+		assert!(!s.steered());
+		assert_eq!(s.interval(), INTERVAL);
+		let after = commits
+			.iter()
+			.position(|at| *at >= t0 + ms(1_800) + CORRECTION_TIMEOUT)
+			.unwrap();
+		assert!(
+			spacings_us(&commits[after..]).iter().all(|spacing| *spacing == 10_000),
+			"{:?}",
+			spacings_us(&commits[after..])
+		);
+	}
+
+	#[test]
+	fn a_tick_paced_client_keeps_its_headroom_on_a_faster_corrected_period() {
+		// 1% faster than nominal: the client still averages one interval, so it
+		// is not held back to the nominal rate.
+		let (mut s, t0) = scheduler();
+		s.correct(correction(INTERVAL.mul_f64(0.99), 0), t0);
+		commits_on_the_tick(&mut s, t0, t0 + ms(900));
+		assert!(!s.over_rate(), "cadence {:?}", s.cadence);
 	}
 }

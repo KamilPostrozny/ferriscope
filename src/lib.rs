@@ -39,6 +39,7 @@
 //! | Optional `--steam` mode | `steam` |
 //! | Touch click modes | `touch` |
 //! | Pen input via `zwp_tablet_v2` (ferriscope extension) | `shell::pen` |
+//! | Embedder-steered frame clock (ferriscope extension) | `frame_clock` |
 //! | Steam on-screen keyboard (`gamescope_input_method`) | `ime` |
 //! | Colour / HDR metadata | `colour_meta` |
 //! | HDR content classification (WSI swapchain) | `hdr` |
@@ -56,6 +57,7 @@ mod delivery;
 mod error;
 mod focus;
 mod frame;
+mod frame_clock;
 mod hdr;
 mod ime;
 mod keyboard;
@@ -84,6 +86,9 @@ pub use error::{Error, Result};
 pub use frame::{DmaBufFrame, Frame, FrameData, FrameInfo};
 #[cfg(feature = "test-support")]
 pub use frame::{PixelBuffer, PixelFormat};
+pub use frame_clock::{
+	CORRECTION_TIMEOUT, FrameClockCorrection, FrameClockSender, MAX_PERIOD_DEVIATION, MAX_PHASE_STEP,
+};
 pub use keyboard::KeyboardConfig;
 pub use seat::{InputEvent, PenEvent, PenTool, pen_tilt};
 #[cfg(feature = "test-support")]
