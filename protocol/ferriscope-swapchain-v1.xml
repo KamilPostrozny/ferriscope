@@ -183,7 +183,10 @@
 
     <event name="refresh_cycle">
       <description summary="compositor refresh cycle for this swapchain">
-        Fired when the compositor's refresh period changes.
+        Fired for each new swapchain (at its first swapchain_feedback or
+        override_window_content) and whenever the compositor's refresh period
+        changes, so a swapchain recreated on the same surface learns the
+        period too.
       </description>
       <arg name="refresh_cycle_hi" type="uint" summary="high 32 bits of refresh cycle in nanoseconds"/>
       <arg name="refresh_cycle_lo" type="uint" summary="low 32 bits of refresh cycle in nanoseconds"/>
