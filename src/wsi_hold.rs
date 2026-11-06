@@ -5,6 +5,8 @@
 //! embedder deciding from an application's environment whether the layer will
 //! hold it read the variable the same way.
 
+use std::fmt;
+
 /// Which applications ferriscope-wsi holds at the end of `vkQueuePresentKHR`
 /// until the compositor can take their next frame in time
 /// (`ferriscope_swapchain_v1.frame_ready`), so each loop iteration, input
@@ -22,17 +24,38 @@ pub enum WsiHold {
 	Off,
 }
 
+/// A `FERRISCOPE_WSI_HOLD` value other than `fifo`, `off`, `0` and `false`
+/// (`FIFO`, `Off`, `no`, ...).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnrecognisedHold(pub String);
+
+impl fmt::Display for UnrecognisedHold {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"{}={:?} is not one of fifo, off, 0, false",
+			WsiHold::VARIABLE,
+			self.0
+		)
+	}
+}
+
+impl std::error::Error for UnrecognisedHold {}
+
 impl WsiHold {
 	/// The environment variable that selects the hold.
 	pub const VARIABLE: &str = "FERRISCOPE_WSI_HOLD";
 
-	/// The hold a `FERRISCOPE_WSI_HOLD` value selects: `fifo`, or `off` (also
-	/// `0`, `false`); anything else, unset included, holds every present mode.
-	pub fn from_value(value: Option<&str>) -> Self {
+	/// The hold a `FERRISCOPE_WSI_HOLD` value selects: unset or empty holds
+	/// every present mode, `fifo` FIFO only, and `off` (also `0`, `false`)
+	/// nothing. Any other value is an error, never "hold everything": it was
+	/// set to opt an application out, and a typo must not leave it held.
+	pub fn parse(value: Option<&str>) -> Result<Self, UnrecognisedHold> {
 		match value {
-			Some("fifo") => Self::Fifo,
-			Some("off" | "0" | "false") => Self::Off,
-			_ => Self::Every,
+			None | Some("") => Ok(Self::Every),
+			Some("fifo") => Ok(Self::Fifo),
+			Some("off" | "0" | "false") => Ok(Self::Off),
+			Some(other) => Err(UnrecognisedHold(other.to_string())),
 		}
 	}
 }

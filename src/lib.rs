@@ -95,7 +95,7 @@ pub use seat::{InputEvent, PenEvent, PenTool, pen_tilt};
 #[cfg(feature = "test-support")]
 pub use steam::display_id_to_server_id;
 pub use touch::TouchClickMode;
-pub use wsi_hold::WsiHold;
+pub use wsi_hold::{UnrecognisedHold, WsiHold};
 
 // Re-export the smithay buffer types exposed by the public frame API, so a
 // consumer does not need to depend on the same smithay git revision. `Dmabuf`

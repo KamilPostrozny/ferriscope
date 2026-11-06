@@ -154,9 +154,14 @@ impl Hold {
 	}
 }
 
-/// [`Hold`] from `FERRISCOPE_WSI_HOLD` ([`Hold::from_value`]).
+/// [`Hold`] from `FERRISCOPE_WSI_HOLD` ([`Hold::parse`]). An unrecognised
+/// value is rejected with an error line and holds nothing: it was set to opt
+/// the application out.
 pub fn hold(env: Env) -> Hold {
-	Hold::from_value(env(Hold::VARIABLE).as_deref())
+	Hold::parse(env(Hold::VARIABLE).as_deref()).unwrap_or_else(|rejected| {
+		crate::log_error!("{rejected}: rejected, holding no present mode");
+		Hold::Off
+	})
 }
 
 /// The Steam app id (`SteamAppId`), 0 when not under Steam.
@@ -317,11 +322,27 @@ mod tests {
 
 	#[test]
 	fn every_present_mode_is_held_by_default() {
-		for value in [None, Some(""), Some("all"), Some("bogus")] {
+		for value in [None, Some("")] {
 			let pairs: Vec<(&str, &str)> = value.map(|v| ("FERRISCOPE_WSI_HOLD", v)).into_iter().collect();
 			let hold = hold(&env_of(&pairs));
 			for mode in MODES {
 				assert!(hold.holds(mode, 2), "{value:?} does not hold {mode:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn an_unrecognised_hold_value_is_rejected_not_read_as_hold_everything() {
+		for value in ["FIFO", "Off", "all", "no", "fifo "] {
+			assert_eq!(
+				Hold::parse(Some(value)),
+				Err(crate::wsi_hold::UnrecognisedHold(value.to_string())),
+				"{value}"
+			);
+			// Someone set the variable to opt out: the layer holds nothing.
+			let hold = hold(&env_of(&[("FERRISCOPE_WSI_HOLD", value)]));
+			for mode in MODES {
+				assert!(!hold.holds(mode, 2), "{value} holds {mode:?}");
 			}
 		}
 	}

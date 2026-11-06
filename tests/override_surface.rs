@@ -17,6 +17,7 @@
 //! ```
 
 use std::{
+	collections::HashMap,
 	io::Write,
 	os::{
 		fd::{AsFd, OwnedFd},
@@ -34,7 +35,9 @@ use smithay::reexports::x11rb::{
 	rust_connection::RustConnection,
 };
 use wayland_client::{
-	Connection as WlConnection, Dispatch, QueueHandle, delegate_noop,
+	Connection as WlConnection, Dispatch, Proxy, QueueHandle,
+	backend::ObjectId,
+	delegate_noop,
 	globals::{GlobalListContents, registry_queue_init},
 	protocol::{wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface},
 };
@@ -205,17 +208,22 @@ struct Session {
 
 impl Session {
 	fn start(tag: &str) -> Self {
-		Self::start_with(tag, false)
+		Self::start_with(tag, false, 60.0)
+	}
+
+	/// A session ticking at `rate` Hz.
+	fn start_at(tag: &str, rate: f64) -> Self {
+		Self::start_with(tag, false, rate)
 	}
 
 	/// A session whose X window draws nothing, so Xwayland never commits a
 	/// buffer for it (a Vulkan game presenting through the WSI layer), with an
 	/// input control stream and the window listening for button presses.
 	fn start_for_input(tag: &str) -> Self {
-		Self::start_with(tag, true)
+		Self::start_with(tag, true, 60.0)
 	}
 
-	fn start_with(tag: &str, input: bool) -> Self {
+	fn start_with(tag: &str, input: bool, rate: f64) -> Self {
 		let record_dir = unique_dir(tag);
 		let control_path = input.then(|| unique_dir(&format!("{tag}-control")));
 		let listener = control_path
@@ -224,6 +232,7 @@ impl Session {
 		let config = CompositorConfig {
 			width: WIDTH as u32,
 			height: HEIGHT as u32,
+			rate,
 			xwayland: true,
 			output: ferriscope::FrameOutput::Recorder(ferriscope::RecorderOutput {
 				dir: Some(record_dir.clone()),
@@ -360,6 +369,8 @@ fn create_input_window(conn: &RustConnection) -> Window {
 #[derive(Default)]
 struct Observed {
 	refresh_cycle_ns: Option<u64>,
+	/// The last `refresh_cycle` each ferriscope swapchain got.
+	swapchain_refresh_ns: HashMap<ObjectId, u64>,
 	retired: bool,
 	hdr_available: Option<bool>,
 	xwayland_server: Option<u32>,
@@ -526,7 +537,7 @@ impl Dispatch<gamescope_swapchain::GamescopeSwapchain, ()> for ClientState {
 impl Dispatch<ferriscope_swapchain_v1::FerriscopeSwapchainV1, ()> for ClientState {
 	fn event(
 		state: &mut Self,
-		_: &ferriscope_swapchain_v1::FerriscopeSwapchainV1,
+		swapchain: &ferriscope_swapchain_v1::FerriscopeSwapchainV1,
 		event: ferriscope_swapchain_v1::Event,
 		_: &(),
 		_: &WlConnection,
@@ -537,8 +548,9 @@ impl Dispatch<ferriscope_swapchain_v1::FerriscopeSwapchainV1, ()> for ClientStat
 				refresh_cycle_hi,
 				refresh_cycle_lo,
 			} => {
-				state.observed.refresh_cycle_ns =
-					Some((u64::from(refresh_cycle_hi) << 32) | u64::from(refresh_cycle_lo));
+				let nanos = (u64::from(refresh_cycle_hi) << 32) | u64::from(refresh_cycle_lo);
+				state.observed.refresh_cycle_ns = Some(nanos);
+				state.observed.swapchain_refresh_ns.insert(swapchain.id(), nanos);
 			},
 			ferriscope_swapchain_v1::Event::Retired => state.observed.retired = true,
 			ferriscope_swapchain_v1::Event::FrameReady => state.observed.frame_ready += 1,
@@ -773,6 +785,47 @@ fn a_version_1_swapchain_gets_frame_ready_for_fifo_only() {
 	for (mode, name) in [(1, "MAILBOX"), (0, "IMMEDIATE")] {
 		let ready = frame_ready_in_500ms(&session, &mut client, mode, name);
 		assert_eq!(ready, 0, "{name}: frame_ready sent to a version 1 swapchain");
+	}
+	drop(client.conn);
+}
+
+/// A swapchain recreated on the same surface (a resize, a VSync or fullscreen
+/// toggle) gets the session's refresh as the surface's first one did. The
+/// layer starts every swapchain at 60 Hz, which in a 120 Hz session would hold
+/// a Game with 7.8–15.6 ms frames to 60 fps.
+#[test]
+#[ignore = "requires GPU and Xwayland"]
+fn a_recreated_swapchain_gets_the_sessions_refresh() {
+	const REFRESH_120_HZ: u64 = 8_333_333;
+	let session = Session::start_at("recreate", 120.0);
+	assert_x11_content(&session);
+
+	let mut client = session.wayland_client();
+	let qh = client.qh();
+	let surface = client.solid_surface(OVERRIDE_COLOR);
+	let mut previous: Option<ferriscope_swapchain_v1::FerriscopeSwapchainV1> = None;
+	// `vkCreateSwapchainKHR` with the old swapchain still alive (`oldSwapchain`),
+	// then a Game that destroys its swapchain before creating the next one.
+	for (round, destroy_first) in [false, false, true].into_iter().enumerate() {
+		if destroy_first && let Some(old) = previous.take() {
+			old.destroy();
+		}
+		// What the layer sends from `vkCreateSwapchainKHR` and its first present.
+		let swapchain = client.state.ferriscope_factory.create_swapchain(&surface, &qh, ());
+		swapchain.swapchain_feedback(3, 37, 0, 1, 1, 1, "test-engine".to_string());
+		swapchain.override_window_content(session.server_id(), session.window);
+		swapchain.set_present_mode(1);
+		surface.commit();
+		if let Some(old) = previous.take() {
+			old.destroy();
+		}
+		client.roundtrip();
+		assert_eq!(
+			client.state.observed.swapchain_refresh_ns.get(&swapchain.id()),
+			Some(&REFRESH_120_HZ),
+			"swapchain {round} on the surface did not get the 120 Hz refresh cycle"
+		);
+		previous = Some(swapchain);
 	}
 	drop(client.conn);
 }

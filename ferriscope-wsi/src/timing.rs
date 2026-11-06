@@ -143,11 +143,24 @@ impl SwapchainShared {
 	}
 
 	/// Whether the application should be held for `frame_ready` now.
-	pub fn should_gate(&self) -> bool {
+	fn should_gate(&self) -> bool {
 		self.render
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
 			.should_gate(self.refresh_cycle_ns())
+	}
+
+	/// Whether the present just noted waits for `frame_ready`: while the
+	/// application's frames fit the gate ([`RenderPeak::should_gate`]). An
+	/// ungated present is never waited for, so it counts as answered: the first
+	/// held present after an ungated stretch then waits for the next tick, not
+	/// for the stretch's backlog until the wait budget runs out.
+	pub fn gates_present(&self) -> bool {
+		let gate = self.should_gate();
+		if !gate {
+			self.resync();
+		}
+		gate
 	}
 
 	/// How many held presents the compositor has not yet said it had room after.
@@ -293,6 +306,40 @@ mod tests {
 		shared.note_present(0);
 		shared.note_present(0);
 		shared.resync();
+		assert_eq!(shared.frames_ahead(), 0);
+	}
+
+	#[test]
+	fn an_ungated_stretch_is_followed_by_a_held_present_within_one_refresh() {
+		let refresh = 8_333_333;
+		let shared = SwapchainShared::new();
+		shared.on_refresh_cycle(0, refresh as u32);
+		// A 12 ms hitch: the application is no longer held.
+		let mut now = 1_000_000_000;
+		shared.note_frame_start(now);
+		now += 12_000_000;
+		shared.note_present(now);
+		assert!(!shared.gates_present());
+		// Back to 2 ms frames, unheld while the peak decays: four presents per
+		// tick, each tick's `frame_ready` answering one of them.
+		let mut unheld = 0;
+		loop {
+			shared.note_frame_start(now);
+			now += 2_000_000;
+			shared.note_present(now);
+			if shared.gates_present() {
+				break;
+			}
+			unheld += 1;
+			if unheld % 4 == 0 {
+				shared.on_frame_ready();
+			}
+		}
+		assert!(unheld > 8, "a stretch of {unheld} unheld presents");
+		// The present that is held again waits for the next tick only, not for
+		// the stretch's backlog until the 2-refresh budget runs out.
+		assert_eq!(shared.frames_ahead(), 1);
+		shared.on_frame_ready();
 		assert_eq!(shared.frames_ahead(), 0);
 	}
 

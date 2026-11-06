@@ -267,8 +267,9 @@ pub fn take_commit_hints(surface: &WlSurface) -> CommitHints {
 	with_swapchain_surface(surface, |wsi| std::mem::take(&mut wsi.hints))
 }
 
-/// Tell every swapchain on `surface` the refresh period, once per change
-/// (`wlserver_refresh_cycle`, `wlserver.cpp:1676`).
+/// Tell every swapchain on `surface` the refresh period, once per change and
+/// once per new swapchain ([`register_swapchain`]) (`wlserver_refresh_cycle`,
+/// `wlserver.cpp:1676`).
 pub fn send_refresh_cycle(surface: &WlSurface, nanos: u64) {
 	with_swapchain_surface(surface, |wsi| {
 		if wsi.refresh_cycle_sent == nanos {
@@ -423,12 +424,17 @@ impl GlobalDispatch2<FerriscopeSwapchainFactoryV1, FerriscopeState> for Swapchai
 
 /// Register a new swapchain object on `surface`
 /// (`gamescope_swapchain_factory_v2_create_swapchain`, `wlserver.cpp:1100`).
+/// The refresh already sent to the surface is forgotten, so the next
+/// `swapchain_feedback` sends the new swapchain the session's refresh: one
+/// recreated on the same surface (a resize, a VSync or fullscreen toggle)
+/// would otherwise keep the layer's 60 Hz default.
 fn register_swapchain(surface: &WlSurface, object: SwapchainObject) {
 	with_swapchain_surface(surface, |wsi| {
 		if !wsi.objects.is_empty() {
 			tracing::warn!("create_swapchain: the surface already has a swapchain");
 		}
 		wsi.objects.push(object);
+		wsi.refresh_cycle_sent = 0;
 	});
 }
 
