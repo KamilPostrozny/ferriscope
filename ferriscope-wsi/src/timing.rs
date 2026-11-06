@@ -98,7 +98,7 @@ pub struct SwapchainShared {
 	/// a free image is not the application's own frame time.
 	blocked_ns: AtomicU64,
 	pub render: Mutex<RenderPeak>,
-	/// FIFO presents sent.
+	/// Presents sent in a present mode the layer holds for `frame_ready`.
 	presented: AtomicU64,
 	/// `frame_ready` events seen for them (never more than `presented`).
 	ready: AtomicU64,
@@ -129,7 +129,7 @@ impl SwapchainShared {
 		self.blocked_ns.fetch_add(ns, Ordering::AcqRel);
 	}
 
-	/// A FIFO present was sent.
+	/// A present was sent in a present mode the layer holds for `frame_ready`.
 	pub fn note_present(&self, now_ns: u64) {
 		self.presented.fetch_add(1, Ordering::AcqRel);
 		let started = self.started_at_ns.swap(0, Ordering::AcqRel);
@@ -150,7 +150,7 @@ impl SwapchainShared {
 			.should_gate(self.refresh_cycle_ns())
 	}
 
-	/// How many FIFO presents the compositor has not yet said it had room after.
+	/// How many held presents the compositor has not yet said it had room after.
 	pub fn frames_ahead(&self) -> u64 {
 		let presented = self.presented.load(Ordering::Acquire);
 		presented.saturating_sub(self.ready.load(Ordering::Acquire))
