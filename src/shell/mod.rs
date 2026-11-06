@@ -329,7 +329,7 @@ pub(crate) struct Endpoints {
 	pub releases: calloop::channel::Channel<Release>,
 	/// Input events from the consumer.
 	pub input: calloop::channel::Channel<InputEvent>,
-	/// Frame-clock corrections from the consumer.
+	/// Frame-clock corrections and new consumers from the embedder.
 	pub frame_clock: calloop::channel::Channel<FrameClockCommand>,
 	/// One-shot ready signal.
 	pub ready: std::sync::mpsc::SyncSender<Ready>,
@@ -774,12 +774,15 @@ impl FerriscopeState {
 			event_loop
 				.handle()
 				.insert_source(frame_clock, |event, _, state: &mut Self| match event {
-					calloop::channel::Event::Msg(command) => match command.installable(Instant::now()) {
-						Some(correction) => {
-							state.correct_frame_clock(correction);
-							command.acknowledge();
-						},
-						None => tracing::debug!("frame clock: dropped a stale correction"),
+					calloop::channel::Event::Msg(FrameClockCommand::NewConsumer) => state.new_frame_clock_consumer(),
+					calloop::channel::Event::Msg(FrameClockCommand::Correct(queued)) => {
+						match queued.installable(Instant::now()) {
+							Some(correction) => {
+								state.correct_frame_clock(correction);
+								queued.acknowledge();
+							},
+							None => tracing::debug!("frame clock: dropped a stale correction"),
+						}
 					},
 					calloop::channel::Event::Closed => {},
 				})

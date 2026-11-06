@@ -136,9 +136,14 @@ impl FrameClockSender {
 	/// Start steering for a new consumer, whose sequences start over.
 	///
 	/// Corrections sent before this are no longer installed, and
-	/// [`Self::last_applied`] is zero until one sent after it is.
+	/// [`Self::last_applied`] is zero until one sent after it is. The clock goes
+	/// back to its nominal period and drops any phase shift not yet applied, so
+	/// the new consumer starts from the nominal pace rather than the last one's
+	/// steering.
 	pub fn new_consumer(&self) {
 		self.acknowledgements.consumer.fetch_add(1, Ordering::AcqRel);
+		// A compositor that has shut down has no clock left to reset.
+		let _ = self.sender.send(FrameClockCommand::NewConsumer);
 	}
 
 	/// Apply a correction from the next frame callback on.
@@ -150,18 +155,28 @@ impl FrameClockSender {
 	pub fn send(&self, sequence: u32, correction: FrameClockCorrection) -> Result<()> {
 		correction.check(self.nominal)?;
 		self.sender
-			.send(FrameClockCommand {
+			.send(FrameClockCommand::Correct(QueuedCorrection {
 				correction,
 				sequence,
 				consumer: self.acknowledgements.consumer(),
 				sent_at: Instant::now(),
 				acknowledgements: Arc::clone(&self.acknowledgements),
-			})
+			}))
 			.map_err(|_| Error::FrameClock("frame clock channel closed".into()))
 	}
 }
 
-pub(crate) struct FrameClockCommand {
+/// What the embedder asks of the compositor's frame clock, in the order it
+/// asked.
+pub(crate) enum FrameClockCommand {
+	/// A new consumer steers from here: back to the nominal period, with no
+	/// phase shift pending.
+	NewConsumer,
+	/// Install a correction.
+	Correct(QueuedCorrection),
+}
+
+pub(crate) struct QueuedCorrection {
 	correction: FrameClockCorrection,
 	sequence: u32,
 	consumer: u32,
@@ -169,7 +184,7 @@ pub(crate) struct FrameClockCommand {
 	acknowledgements: Arc<Acknowledgements>,
 }
 
-impl FrameClockCommand {
+impl QueuedCorrection {
 	/// The correction to install at `now`; `None` when it was sent for an
 	/// earlier consumer, or [`CORRECTION_TIMEOUT`] or longer ago.
 	pub(crate) fn installable(&self, now: Instant) -> Option<FrameClockCorrection> {
@@ -215,6 +230,17 @@ mod tests {
 
 	fn sent(rx: &calloop::channel::Channel<FrameClockCommand>) -> Vec<FrameClockCommand> {
 		std::iter::from_fn(|| rx.try_recv().ok()).collect()
+	}
+
+	/// The next correction queued for the compositor, past any new-consumer
+	/// command.
+	fn queued(rx: &calloop::channel::Channel<FrameClockCommand>) -> QueuedCorrection {
+		std::iter::from_fn(|| rx.try_recv().ok())
+			.find_map(|command| match command {
+				FrameClockCommand::Correct(queued) => Some(queued),
+				FrameClockCommand::NewConsumer => None,
+			})
+			.expect("a queued correction")
 	}
 
 	#[test]
@@ -264,7 +290,7 @@ mod tests {
 		let (sender, rx) = sender();
 		sender.send(7, correction(10_000, 100)).unwrap();
 		assert_eq!(sender.last_applied(), 0);
-		rx.try_recv().unwrap().acknowledge();
+		queued(&rx).acknowledge();
 		assert_eq!(sender.last_applied(), 7);
 	}
 
@@ -272,11 +298,11 @@ mod tests {
 	fn a_new_consumer_sees_no_acknowledgement_of_an_earlier_ones_corrections() {
 		let (sender, rx) = sender();
 		sender.send(5, correction(10_000, 100)).unwrap();
-		rx.try_recv().unwrap().acknowledge();
+		queued(&rx).acknowledge();
 		sender.new_consumer();
 		assert_eq!(sender.last_applied(), 0);
 		sender.send(1, correction(10_000, 100)).unwrap();
-		rx.try_recv().unwrap().acknowledge();
+		queued(&rx).acknowledge();
 		assert_eq!(sender.last_applied(), 1);
 	}
 
@@ -285,7 +311,7 @@ mod tests {
 		let (sender, rx) = sender();
 		sender.send(5, correction(10_000, 100)).unwrap();
 		sender.new_consumer();
-		let command = rx.try_recv().unwrap();
+		let command = queued(&rx);
 		assert_eq!(command.installable(Instant::now()), None);
 		// Installed just before the consumer changed, acknowledged just after.
 		command.acknowledge();
@@ -293,10 +319,30 @@ mod tests {
 	}
 
 	#[test]
+	fn a_new_consumer_sends_the_compositor_back_to_the_nominal_clock() {
+		let (sender, rx) = sender();
+		sender.send(5, correction(10_050, 400)).unwrap();
+		sender.new_consumer();
+		let commands = sent(&rx);
+		assert!(matches!(
+			commands.as_slice(),
+			[FrameClockCommand::Correct(_), FrameClockCommand::NewConsumer]
+		));
+	}
+
+	#[test]
+	fn a_new_consumer_of_a_stopped_compositor_changes_nothing() {
+		let (sender, rx) = sender();
+		drop(rx);
+		sender.new_consumer();
+		assert_eq!(sender.last_applied(), 0);
+	}
+
+	#[test]
 	fn a_correction_queued_longer_than_the_timeout_is_not_installed() {
 		let (sender, rx) = sender();
 		sender.send(3, correction(10_100, -250)).unwrap();
-		let command = rx.try_recv().unwrap();
+		let command = queued(&rx);
 		let sent = Instant::now();
 		assert_eq!(command.installable(sent), Some(correction(10_100, -250)));
 		assert_eq!(command.installable(sent + CORRECTION_TIMEOUT), None);
