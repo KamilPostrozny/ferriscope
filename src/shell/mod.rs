@@ -767,9 +767,12 @@ impl FerriscopeState {
 			event_loop
 				.handle()
 				.insert_source(frame_clock, |event, _, state: &mut Self| match event {
-					calloop::channel::Event::Msg(command) => {
-						state.correct_frame_clock(command.correction);
-						command.acknowledge();
+					calloop::channel::Event::Msg(command) => match command.installable(Instant::now()) {
+						Some(correction) => {
+							state.correct_frame_clock(correction);
+							command.acknowledge();
+						},
+						None => tracing::debug!("frame clock: dropped a stale correction"),
 					},
 					calloop::channel::Event::Closed => {},
 				})
