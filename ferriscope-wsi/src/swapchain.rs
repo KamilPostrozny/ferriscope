@@ -5,6 +5,9 @@
 //! colour space the application chose reach ferriscope through
 //! `set_present_mode` and `swapchain_feedback`, and ferriscope implements FIFO
 //! itself (one commit per tick), exactly as gamescope does.
+//! Whatever the mode, the layer holds the application at the end of each
+//! present until the compositor's next tick ([`config::Hold`]), so with VSync
+//! on or off it renders one frame per tick on the compositor's frame clock.
 
 use ash::vk::{self, Handle as _};
 
@@ -244,17 +247,26 @@ pub unsafe extern "C" fn destroy_swapchain(
 	}
 }
 
-/// Whether FIFO applications are paced ([`config::pacing`]), read once.
-fn pacing() -> bool {
-	static PACING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-	*PACING.get_or_init(|| config::pacing(&|name: &str| std::env::var(name).ok()))
+/// Which applications are held ([`config::hold`]), read once.
+fn hold() -> config::Hold {
+	static HOLD: std::sync::LazyLock<config::Hold> =
+		std::sync::LazyLock::new(|| config::hold(&|name: &str| std::env::var(name).ok()));
+	*HOLD
 }
 
-/// Hold a FIFO application until the compositor can take its next frame in
+/// Whether `data`, presenting in `mode`, is held for `frame_ready`.
+fn is_held(data: &SwapchainData, mode: vk::PresentModeKHR) -> bool {
+	use wayland_client::Proxy as _;
+	data.object
+		.as_ref()
+		.is_some_and(|object| hold().holds(mode, object.version()))
+}
+
+/// Hold a paced application until the compositor can take its next frame in
 /// time (see `ferriscope_swapchain_v1.frame_ready`), so it starts rendering
 /// right after a tick instead of running ahead of the display.
 fn wait_for_frame_ready(data: &SwapchainData, timeout_ns: u64) {
-	if timeout_ns == 0 || data.object.is_none() || !pacing() || !data.shared.should_gate() {
+	if timeout_ns == 0 || !data.shared.should_gate() {
 		return;
 	}
 	let budget = std::time::Duration::from_nanos((2 * data.shared.refresh_cycle_ns()).min(timeout_ns));
@@ -287,7 +299,7 @@ fn monotonic_ns() -> u64 {
 /// made a game look too slow to hold, and unheld it stayed in the state that
 /// kept it blocked.
 fn note_blocked(swapchain: VkSwapchain, started_ns: u64) {
-	if pacing()
+	if hold().is_on()
 		&& let Some(data) = get_swapchain(swapchain_key(swapchain))
 	{
 		data.shared.note_blocked(monotonic_ns().saturating_sub(started_ns));
@@ -443,7 +455,7 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 			}
 			let mode = original_modes.map_or(data.present_mode, |modes| *(*modes).p_present_modes.add(i));
 			object.set_present_mode(mode.as_raw() as u32);
-			if mode == vk::PresentModeKHR::FIFO {
+			if is_held(data, mode) {
 				data.shared.note_present(monotonic_ns());
 			}
 		}
@@ -514,14 +526,12 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 		// Hold the game here rather than in its next acquire: it reads input
 		// after this returns, so the frame it then renders shows input from
 		// right after the tick instead of input a frame old.
-		if pacing() {
-			for (i, data) in tracked.iter().enumerate() {
-				let Some(data) = data else { continue };
-				let mode = original_modes.map_or(data.present_mode, |modes| *(*modes).p_present_modes.add(i));
-				if mode == vk::PresentModeKHR::FIFO {
-					wait_for_frame_ready(data, u64::MAX);
-					data.shared.note_frame_start(monotonic_ns());
-				}
+		for (i, data) in tracked.iter().enumerate() {
+			let Some(data) = data else { continue };
+			let mode = original_modes.map_or(data.present_mode, |modes| *(*modes).p_present_modes.add(i));
+			if is_held(data, mode) {
+				wait_for_frame_ready(data, u64::MAX);
+				data.shared.note_frame_start(monotonic_ns());
 			}
 		}
 		result

@@ -40,7 +40,9 @@ fn bind_compositor(connection: Connection, want_compositor: bool) -> Option<Arc<
 	let caps = Arc::new(Caps::default());
 	let (globals, queue) = registry_queue_init::<WaylandState>(&connection).ok()?;
 	let qh = queue.handle();
-	let factory: FerriscopeSwapchainFactoryV1 = match globals.bind(&qh, 1..=1, ()) {
+	// Version 2 sends `frame_ready` for every present mode, so the layer holds
+	// MAILBOX and IMMEDIATE applications too ([`crate::config::Hold`]).
+	let factory: FerriscopeSwapchainFactoryV1 = match globals.bind(&qh, 1..=2, ()) {
 		Ok(factory) => factory,
 		Err(error) => {
 			crate::log_info!("the compositor does not offer ferriscope_swapchain_factory_v1: {error}");

@@ -162,7 +162,7 @@ impl SwapchainObject {
 		}
 	}
 
-	/// `frame_ready`: the swapchain's FIFO queue has room (native protocol only;
+	/// `frame_ready`: a frame started now is taken in time (native protocol only;
 	/// a gamescope layer has no such event).
 	fn frame_ready(&self) {
 		if let Self::Ferriscope(object) = self {
@@ -206,6 +206,9 @@ pub struct CommitHints {
 struct SwapchainSurface {
 	feedback: Option<SwapchainFeedback>,
 	hints: CommitHints,
+	/// The present mode the layer set last; unlike `hints`, kept across
+	/// commits.
+	present_mode: Option<u32>,
 	objects: Vec<SwapchainObject>,
 	refresh_cycle_sent: u64,
 }
@@ -237,6 +240,17 @@ pub fn pending_present_mode(surface: &WlSurface) -> Option<u32> {
 	with_swapchain_surface(surface, |wsi| wsi.hints.present_mode)
 }
 
+/// The present mode the layer set last for `surface`'s swapchain, `None` for a
+/// surface without one.
+pub fn present_mode(surface: &WlSurface) -> Option<u32> {
+	with_states(surface, |states| {
+		states
+			.data_map
+			.get::<SurfaceSwapchainCell>()
+			.and_then(|cell| cell.lock().unwrap().present_mode)
+	})
+}
+
 /// Take the hints the layer set for `surface`'s next commit; they apply to one
 /// commit only.
 pub fn take_commit_hints(surface: &WlSurface) -> CommitHints {
@@ -257,7 +271,7 @@ pub fn send_refresh_cycle(surface: &WlSurface, nanos: u64) {
 	});
 }
 
-/// Tell every swapchain on `surface` that its FIFO queue has room.
+/// Tell every swapchain on `surface` that a frame started now is taken in time.
 pub fn send_frame_ready(surface: &WlSurface) {
 	with_swapchain_surface(surface, |wsi| {
 		for object in &wsi.objects {
@@ -303,7 +317,7 @@ impl SwapchainGlobals {
 				SwapchainFactoryData,
 			),
 			_ferriscope: display.create_global::<FerriscopeState, FerriscopeSwapchainFactoryV1, SwapchainFactoryData>(
-				1,
+				2,
 				SwapchainFactoryData,
 			),
 		}
@@ -529,7 +543,10 @@ macro_rules! dispatch_swapchain {
 				$state.swapchain_feedback_received(&$data.surface);
 			},
 			Request::SetPresentMode { vk_present_mode } => {
-				with_swapchain_surface(&$data.surface, |wsi| wsi.hints.present_mode = Some(vk_present_mode));
+				with_swapchain_surface(&$data.surface, |wsi| {
+					wsi.hints.present_mode = Some(vk_present_mode);
+					wsi.present_mode = Some(vk_present_mode);
+				});
 			},
 			Request::SetHdrMetadata {
 				display_primary_red_x,

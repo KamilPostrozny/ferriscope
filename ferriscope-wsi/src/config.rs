@@ -6,6 +6,8 @@
 //! frame-limiter flags: ferriscope has no dynamic limiter, so there is no
 //! forced-FIFO state for an application to be aware of.
 
+use ash::vk;
+
 /// Looks an environment variable up; `None` when unset.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
 
@@ -128,12 +130,50 @@ pub fn ensure_min_image_count(env: Env) -> bool {
 		.unwrap_or(false)
 }
 
-/// Whether a FIFO application is held at the end of `vkQueuePresentKHR` until
-/// the compositor can take its next frame in time, so its next loop iteration,
-/// input included, starts right after a tick. On unless
-/// `FERRISCOPE_WSI_PACING` is `0`, `false` or `off`.
-pub fn pacing(env: Env) -> bool {
-	!matches!(env("FERRISCOPE_WSI_PACING").as_deref(), Some("0" | "false" | "off"))
+/// Which applications are held at the end of `vkQueuePresentKHR` until the
+/// compositor can take their next frame in time
+/// (`ferriscope_swapchain_v1.frame_ready`), so each loop iteration, input
+/// included, starts right after a tick and the application renders one frame
+/// per tick on the compositor's frame clock (`FERRISCOPE_WSI_HOLD`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+	/// Every present mode (the default): an application with VSync off renders
+	/// one frame per tick instead of unbounded frames only the newest of which
+	/// is shown.
+	Every,
+	/// FIFO only (`fifo`): MAILBOX and IMMEDIATE render unbounded.
+	Fifo,
+	/// No application (`off`, `0`, `false`).
+	Off,
+}
+
+impl Hold {
+	/// Whether any application is held.
+	pub fn is_on(self) -> bool {
+		self != Self::Off
+	}
+
+	/// Whether a swapchain presenting in `mode` is held, given the
+	/// `ferriscope_swapchain_v1` version the compositor speaks: before version
+	/// 2 it sends `frame_ready` for FIFO only.
+	pub fn holds(self, mode: vk::PresentModeKHR, version: u32) -> bool {
+		let fifo = mode == vk::PresentModeKHR::FIFO;
+		match self {
+			Self::Every => fifo || version >= 2,
+			Self::Fifo => fifo,
+			Self::Off => false,
+		}
+	}
+}
+
+/// [`Hold`] from `FERRISCOPE_WSI_HOLD`: `fifo` or `off` (also `0`, `false`);
+/// anything else, unset included, holds every present mode.
+pub fn hold(env: Env) -> Hold {
+	match env("FERRISCOPE_WSI_HOLD").as_deref() {
+		Some("fifo") => Hold::Fifo,
+		Some("off" | "0" | "false") => Hold::Off,
+		_ => Hold::Every,
+	}
 }
 
 /// The Steam app id (`SteamAppId`), 0 when not under Steam.
@@ -285,12 +325,52 @@ mod tests {
 		)])));
 	}
 
+	const MODES: [vk::PresentModeKHR; 4] = [
+		vk::PresentModeKHR::FIFO,
+		vk::PresentModeKHR::FIFO_RELAXED,
+		vk::PresentModeKHR::MAILBOX,
+		vk::PresentModeKHR::IMMEDIATE,
+	];
+
 	#[test]
-	fn pacing_is_on_unless_switched_off() {
-		assert!(pacing(&env_of(&[])));
-		assert!(pacing(&env_of(&[("FERRISCOPE_WSI_PACING", "1")])));
-		assert!(!pacing(&env_of(&[("FERRISCOPE_WSI_PACING", "0")])));
-		assert!(!pacing(&env_of(&[("FERRISCOPE_WSI_PACING", "off")])));
+	fn every_present_mode_is_held_by_default() {
+		for value in [None, Some(""), Some("all"), Some("bogus")] {
+			let pairs: Vec<(&str, &str)> = value.map(|v| ("FERRISCOPE_WSI_HOLD", v)).into_iter().collect();
+			let hold = hold(&env_of(&pairs));
+			for mode in MODES {
+				assert!(hold.holds(mode, 2), "{value:?} does not hold {mode:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn the_fifo_opt_out_leaves_other_modes_unbounded() {
+		let hold = hold(&env_of(&[("FERRISCOPE_WSI_HOLD", "fifo")]));
+		assert!(hold.holds(vk::PresentModeKHR::FIFO, 2));
+		assert!(!hold.holds(vk::PresentModeKHR::FIFO_RELAXED, 2));
+		assert!(!hold.holds(vk::PresentModeKHR::MAILBOX, 2));
+		assert!(!hold.holds(vk::PresentModeKHR::IMMEDIATE, 2));
+	}
+
+	#[test]
+	fn the_hold_can_be_switched_off() {
+		for value in ["off", "0", "false"] {
+			let hold = hold(&env_of(&[("FERRISCOPE_WSI_HOLD", value)]));
+			assert!(!hold.is_on(), "{value}");
+			for mode in MODES {
+				assert!(!hold.holds(mode, 2), "{value} holds {mode:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn a_version_1_compositor_only_paces_fifo() {
+		// It sends `frame_ready` for FIFO swapchains only: holding another
+		// mode there would wait out the timeout every frame.
+		let hold = hold(&env_of(&[]));
+		assert!(hold.holds(vk::PresentModeKHR::FIFO, 1));
+		assert!(!hold.holds(vk::PresentModeKHR::MAILBOX, 1));
+		assert!(!hold.holds(vk::PresentModeKHR::IMMEDIATE, 1));
 	}
 
 	#[test]
