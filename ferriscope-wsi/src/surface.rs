@@ -172,12 +172,16 @@ pub unsafe extern "C" fn create_xlib_surface(
 		if connection.is_null() {
 			return VK_ERROR_FEATURE_NOT_PRESENT;
 		}
+		// An XID fits 32 bits. Xlib's `Window` is a C `unsigned long`: 64-bit on
+		// x86_64, already `u32` on i686.
+		#[allow(clippy::unnecessary_cast)]
+		let window = create_info.window as u32;
 		let xcb_info = VkXcbSurfaceCreateInfoKHR {
 			s_type: vk::StructureType::XCB_SURFACE_CREATE_INFO_KHR,
 			p_next: std::ptr::null(),
 			flags: vk::XcbSurfaceCreateFlagsKHR::empty(),
 			connection,
-			window: create_info.window as u32,
+			window,
 			_marker: PhantomData,
 		};
 		create_xcb_surface(instance, &xcb_info, p_allocator, p_surface)

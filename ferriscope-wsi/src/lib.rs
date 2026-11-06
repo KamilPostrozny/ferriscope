@@ -39,6 +39,10 @@ mod surface;
 mod swapchain;
 mod timing;
 mod xcb;
+// `FERRISCOPE_WSI_HOLD`'s parser, shared with the ferriscope crate (which
+// exports it as `WsiHold`) so embedders read the variable as the layer does.
+#[path = "../../src/wsi_hold.rs"]
+mod wsi_hold;
 
 /// The layer name, as the manifest and the layer-specific extension
 /// enumeration know it.

@@ -130,22 +130,10 @@ pub fn ensure_min_image_count(env: Env) -> bool {
 		.unwrap_or(false)
 }
 
-/// Which applications are held at the end of `vkQueuePresentKHR` until the
-/// compositor can take their next frame in time
-/// (`ferriscope_swapchain_v1.frame_ready`), so each loop iteration, input
-/// included, starts right after a tick and the application renders one frame
-/// per tick on the compositor's frame clock (`FERRISCOPE_WSI_HOLD`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Hold {
-	/// Every present mode (the default): an application with VSync off renders
-	/// one frame per tick instead of unbounded frames only the newest of which
-	/// is shown.
-	Every,
-	/// FIFO only (`fifo`): MAILBOX and IMMEDIATE render unbounded.
-	Fifo,
-	/// No application (`off`, `0`, `false`).
-	Off,
-}
+/// Which applications are held at the end of `vkQueuePresentKHR`
+/// (`FERRISCOPE_WSI_HOLD`): the type the ferriscope crate exports as
+/// `WsiHold`, so an embedder parses the variable as the layer does.
+pub use crate::wsi_hold::WsiHold as Hold;
 
 impl Hold {
 	/// Whether any application is held.
@@ -166,14 +154,9 @@ impl Hold {
 	}
 }
 
-/// [`Hold`] from `FERRISCOPE_WSI_HOLD`: `fifo` or `off` (also `0`, `false`);
-/// anything else, unset included, holds every present mode.
+/// [`Hold`] from `FERRISCOPE_WSI_HOLD` ([`Hold::from_value`]).
 pub fn hold(env: Env) -> Hold {
-	match env("FERRISCOPE_WSI_HOLD").as_deref() {
-		Some("fifo") => Hold::Fifo,
-		Some("off" | "0" | "false") => Hold::Off,
-		_ => Hold::Every,
-	}
+	Hold::from_value(env(Hold::VARIABLE).as_deref())
 }
 
 /// The Steam app id (`SteamAppId`), 0 when not under Steam.

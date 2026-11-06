@@ -75,18 +75,25 @@ const TOKEN_REFILL_HEADROOM: f64 = 1.05;
 /// within a dispatch of each other.
 const CHANGE_GROUPING: Duration = Duration::from_micros(500);
 
-/// Weight of the newest change spacing in the change cadence average.
-const CADENCE_WEIGHT: f64 = 1.0 / 16.0;
+/// How many of the latest change spacings the change cadence is the median of.
+///
+/// A median rather than an average: a second surface that commits sparsely
+/// (a launcher or helper window, every few hundred ms) splits one spacing in
+/// two, which drags an average of a session-rate scene below [`OVER_RATE`]
+/// and takes its headroom away, while the median of a window this long
+/// ignores it. A scene that changes faster than the rate on most spacings
+/// still reads as over it.
+const CADENCE_WINDOW: usize = 15;
 
 /// A change spacing sample is clamped to this many intervals, so an idle gap
 /// does not hide a scene that resumes changing above the rate for long.
 const CADENCE_SAMPLE_CAP: f64 = 2.0;
 
-/// The change cadence, as a fraction of the interval, below which the scene
-/// counts as changing faster than the session rate. A client paced at the
-/// session rate (FIFO on the tick, frame callbacks) runs on ferriscope's own
-/// clock and averages exactly one interval; the margin keeps measurement noise
-/// from taking its headroom away.
+/// The change cadence, in intervals, below which the scene counts as changing
+/// faster than the session rate. A client paced at the session rate (FIFO on
+/// the tick, frame callbacks) runs on ferriscope's own clock and changes the
+/// scene exactly one interval apart; the margin keeps measurement noise from
+/// taking its headroom away.
 const OVER_RATE: f64 = 0.995;
 
 /// Slack on the token comparison, so float rounding in the refill deadline does
@@ -123,8 +130,14 @@ pub(in crate::shell) struct Scheduler {
 	tokens: f64,
 	/// When `tokens` was last refilled.
 	last_refill: Instant,
-	/// Average spacing of the scene's changes (grouped by [`CHANGE_GROUPING`]),
-	/// in intervals; `None` before the second change.
+	/// The latest change spacings (grouped by [`CHANGE_GROUPING`]), in
+	/// intervals, oldest overwritten first; the first `spacings_len` are set.
+	spacings: [f64; CADENCE_WINDOW],
+	/// How many of `spacings` hold a spacing.
+	spacings_len: usize,
+	/// Where the next spacing goes in `spacings`.
+	spacings_next: usize,
+	/// The median of `spacings`; `None` before the second change.
 	cadence: Option<f64>,
 	/// The scene signature [`Self::observe`] last saw.
 	observed_scene: Option<u64>,
@@ -175,6 +188,9 @@ impl Scheduler {
 			last_frame_at: now,
 			tokens: TOKEN_CAPACITY,
 			last_refill: now,
+			spacings: [0.0; CADENCE_WINDOW],
+			spacings_len: 0,
+			spacings_next: 0,
 			cadence: None,
 			observed_scene: None,
 			last_change_at: None,
@@ -268,10 +284,14 @@ impl Scheduler {
 		self.tokens = self.tokens_at(now);
 		self.last_refill = now;
 		let sample = (gap.as_secs_f64() / self.interval.as_secs_f64()).min(CADENCE_SAMPLE_CAP);
-		self.cadence = Some(match self.cadence {
-			Some(cadence) => cadence + (sample - cadence) * CADENCE_WEIGHT,
-			None => sample,
-		});
+		self.spacings[self.spacings_next] = sample;
+		self.spacings_next = (self.spacings_next + 1) % CADENCE_WINDOW;
+		self.spacings_len = (self.spacings_len + 1).min(CADENCE_WINDOW);
+		let mut window = self.spacings;
+		let window = &mut window[..self.spacings_len];
+		let middle = window.len() / 2;
+		let (_, median, _) = window.select_nth_unstable_by(middle, f64::total_cmp);
+		self.cadence = Some(*median);
 		self.last_change_at = Some(now);
 	}
 
@@ -381,12 +401,18 @@ impl Scheduler {
 	/// The target advances by one interval from its previous value rather than
 	/// from `now`, so the cadence does not drift by the dispatch latency, plus at
 	/// most [`MAX_PHASE_STEP`] of a pending phase shift; if the loop overran, it
-	/// snaps forward instead of bursting.
+	/// snaps forward instead of bursting. The delivery token clock moves by the
+	/// same step, so a frame that waits for a token (a scene held to the rate)
+	/// moves with the Phase shift as one delivered on commit does.
 	pub(in crate::shell) fn callbacks_sent(&mut self, now: Instant) {
 		self.expire_correction(now);
 		let max_step = MAX_PHASE_STEP.min(self.interval / 2).as_nanos() as i64;
 		let step = self.pending_shift_ns.clamp(-max_step, max_step);
 		self.pending_shift_ns -= step;
+		if step != 0 {
+			self.tokens = self.tokens_at(now) - step as f64 / self.refill_period().as_nanos() as f64;
+			self.last_refill = now;
+		}
 		let shift = Duration::from_nanos(step.unsigned_abs());
 		self.next_callback = if step >= 0 {
 			self.next_callback + self.interval + shift
@@ -1147,6 +1173,60 @@ mod tests {
 			.collect()
 	}
 
+	/// [`commits_on_the_tick`] with a second surface (a launcher or helper
+	/// window) that commits on its own every `every` from `*sparse_at`, and
+	/// frames delivered as soon as the scheduler allows rather than asserted on
+	/// commit. Returns each tick commit with the delivery that carried it.
+	fn ticks_with_a_sparse_surface(
+		s: &mut Scheduler,
+		from: Instant,
+		until: Instant,
+		sparse_at: &mut Instant,
+		every: Duration,
+	) -> Vec<(Instant, Instant)> {
+		let mut frames = Vec::new();
+		let mut waiting = Vec::new();
+		let mut pending = None;
+		let mut scene = s.commit_epoch() + 1000;
+		let mut now = from;
+		loop {
+			let ready = pending.map_or(s.next_deadline(None, true, now), |scene| {
+				s.next_deadline(Some(scene), true, now)
+			});
+			now = now.max(ready.min(*sparse_at));
+			if now > until {
+				return frames;
+			}
+			if s.callbacks_due(now) {
+				s.callbacks_sent(now);
+				s.commit(now);
+				scene += 1;
+				s.observe(scene, now);
+				pending = Some(scene);
+				waiting.push(now);
+			}
+			if now >= *sparse_at {
+				s.commit(now);
+				scene += 1;
+				s.observe(scene, now);
+				pending = Some(scene);
+				*sparse_at += every;
+			}
+			if let Some(scene) = pending
+				&& s.should_render(scene, true, now)
+			{
+				s.delivered(scene, now);
+				frames.extend(waiting.drain(..).map(|commit| (commit, now)));
+				pending = None;
+			}
+		}
+	}
+
+	/// Where `at` falls in the nominal 10 ms grid that starts at `t0`, in us.
+	fn grid_phase_us(at: Instant, t0: Instant) -> u64 {
+		((at - t0).as_nanos() % INTERVAL.as_nanos()) as u64 / 1000
+	}
+
 	#[test]
 	fn the_clock_follows_a_corrected_period() {
 		let (mut s, t0) = scheduler();
@@ -1179,6 +1259,95 @@ mod tests {
 		let earlier = commits_on_the_tick(&mut s, now, now + ms(40));
 		assert_eq!(earlier[0], now + INTERVAL);
 		assert_eq!(spacings_us(&earlier[..4]), [9_750, 9_950, 10_000]);
+	}
+
+	#[test]
+	fn a_phase_shift_moves_deliveries_although_a_second_surface_commits_sparsely() {
+		// Ticket 50's 32-bit DXVK run: a tick-paced Game and a second X11
+		// window committing every 500 ms, half an interval off the tick. Its
+		// commits must not leave the Game's frames waiting for tokens on a
+		// clock that Phase shifts do not move.
+		let (mut s, t0) = scheduler();
+		let mut sparse_at = t0 + ms(5);
+		let before = ticks_with_a_sparse_surface(&mut s, t0, t0 + ms(4_000), &mut sparse_at, ms(500));
+		let lag = |frames: &[(Instant, Instant)]| {
+			frames
+				.iter()
+				.map(|(commit, delivery)| *delivery - *commit)
+				.max()
+				.unwrap()
+		};
+		assert!(
+			lag(&before[100..]) < Duration::from_micros(500),
+			"lag before the shift: {:?}",
+			lag(&before[100..])
+		);
+		let now = before.last().unwrap().1;
+		let phase = grid_phase_us(before.last().unwrap().1, t0);
+		s.correct(correction(INTERVAL, 1_500), now);
+		let after = ticks_with_a_sparse_surface(&mut s, now, now + ms(2_000), &mut sparse_at, ms(500));
+		assert!(
+			lag(&after) < Duration::from_micros(500),
+			"lag after the shift: {:?}",
+			lag(&after)
+		);
+		let moved: Vec<u64> = after[10..]
+			.iter()
+			.map(|(_, delivery)| grid_phase_us(*delivery, t0))
+			.collect();
+		assert!(
+			moved.iter().all(|at| at.abs_diff(phase + 1_500) <= 50),
+			"deliveries at {phase} us must move to {} us: {moved:?}",
+			phase + 1_500
+		);
+	}
+
+	#[test]
+	fn a_phase_shift_moves_deliveries_held_to_the_rate() {
+		// A scene changing every 100 us (cursor motion, an uncapped client) is
+		// delivered on the token clock, not on commits: the token clock must
+		// slew with the frame clock, or the Phase lock cannot move it.
+		let (mut s, t0) = scheduler();
+		let step = Duration::from_micros(100);
+		let mut deliveries = Vec::new();
+		let mut scene = 0u64;
+		let mut now = t0;
+		while now < t0 + ms(3_000) {
+			now += step;
+			if now == t0 + ms(2_000) {
+				s.correct(correction(INTERVAL, 1_500), now);
+			}
+			if s.callbacks_due(now) {
+				s.callbacks_sent(now);
+			}
+			s.commit(now);
+			scene += 1;
+			s.observe(scene, now);
+			if s.should_render(scene, true, now) {
+				s.delivered(scene, now);
+				deliveries.push(now);
+			}
+		}
+		// How far each delivery in `from..until` ms sits after `phase` on the
+		// grid, in us.
+		let offsets = |from: u64, until: u64, phase: u64| -> Vec<u64> {
+			deliveries
+				.iter()
+				.filter(|at| **at > t0 + ms(from) && **at < t0 + ms(until))
+				.map(|at| (grid_phase_us(*at, t0) + 10_000 - phase) % 10_000)
+				.collect()
+		};
+		let phase = grid_phase_us(*deliveries.iter().find(|at| **at > t0 + ms(1_000)).unwrap(), t0);
+		let before = offsets(1_000, 2_000, phase);
+		assert!(
+			before.iter().all(|offset| *offset <= 100 || *offset >= 9_900),
+			"{before:?}"
+		);
+		let after = offsets(2_200, 3_000, phase);
+		assert!(
+			after.iter().all(|offset| offset.abs_diff(1_500) <= 100),
+			"deliveries must move 1500 us: {after:?}"
+		);
 	}
 
 	#[test]

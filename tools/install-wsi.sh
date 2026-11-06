@@ -68,9 +68,9 @@ else
 fi
 
 # The 32-bit layer is required: check its toolchain before building anything.
-i686=i686-unknown-linux-gnu
-if [ ! -d "$(rustc --print sysroot)/lib/rustlib/$i686/lib" ]; then
-	echo "the Rust target $i686 is missing (Arch: lib32-rust-libs; rustup: rustup target add $i686)" >&2
+i686_target='i686-unknown-linux-gnu'
+if [ ! -d "$(cd "$root" && rustc --print sysroot)/lib/rustlib/$i686_target/lib" ]; then
+	echo "the Rust target $i686_target is missing (Arch: lib32-rust-libs; rustup: rustup target add $i686_target)" >&2
 	exit 1
 fi
 if ! printf 'int main(void) { return 0; }\n' | cc -m32 -x c - -o /dev/null 2>/dev/null; then
@@ -82,16 +82,17 @@ fi
 # and sudo is only asked for once the layers exist.
 echo "building ferriscope-wsi (x86_64, i686)" >&2
 (cd "$root" && CARGO_TARGET_DIR=$target_dir cargo build -p ferriscope-wsi "${cargo_profile[@]}")
-(cd "$root" && CARGO_TARGET_DIR=$target_dir cargo build -p ferriscope-wsi --target "$i686" "${cargo_profile[@]}")
+(cd "$root" && CARGO_TARGET_DIR=$target_dir cargo build -p ferriscope-wsi --target "$i686_target" "${cargo_profile[@]}")
 
 manifest_dir=$destdir$prefix/share/vulkan/implicit_layer.d
 # install_layer ARCH BUILT LIBDIR
 install_layer() {
-	local library=$prefix/$3/ferriscope/libferriscope_wsi.so
-	as_installer install -Dm755 "$2" "$destdir$library"
-	sed -e "s|@ARCH@|$1|g" -e "s|@LIBRARY_PATH@|$library|g" "$template" |
-		as_installer install -Dm644 /dev/stdin "$manifest_dir/VkLayer_FERRISCOPE_wsi.$1.json"
+	local arch=$1 built=$2 libdir=$3
+	local library=$prefix/$libdir/ferriscope/libferriscope_wsi.so
+	as_installer install -Dm755 "$built" "$destdir$library"
+	sed -e "s|@ARCH@|$arch|g" -e "s|@LIBRARY_PATH@|$library|g" "$template" |
+		as_installer install -Dm644 /dev/stdin "$manifest_dir/VkLayer_FERRISCOPE_wsi.$arch.json"
 	echo "installed $destdir$library" >&2
 }
 install_layer x86_64 "$target_dir/$profile/libferriscope_wsi.so" lib
-install_layer i686 "$target_dir/$i686/$profile/libferriscope_wsi.so" lib32
+install_layer i686 "$target_dir/$i686_target/$profile/libferriscope_wsi.so" lib32
