@@ -150,12 +150,13 @@ impl SwapchainShared {
 			.should_gate(self.refresh_cycle_ns())
 	}
 
-	/// Whether the present just noted waits for `frame_ready`: while the
-	/// application's frames fit the gate ([`RenderPeak::should_gate`]). An
-	/// ungated present is never waited for, so it counts as answered: the first
+	/// Decide whether the present just noted waits for `frame_ready`, and
+	/// resync when it doesn't. It waits while the application's frames fit the
+	/// gate ([`RenderPeak::should_gate`]). An ungated present is never waited
+	/// for, so it is counted as answered here ([`Self::resync`]): the first
 	/// held present after an ungated stretch then waits for the next tick, not
 	/// for the stretch's backlog until the wait budget runs out.
-	pub fn gates_present(&self) -> bool {
+	pub fn gate_or_resync(&self) -> bool {
 		let gate = self.should_gate();
 		if !gate {
 			self.resync();
@@ -319,7 +320,7 @@ mod tests {
 		shared.note_frame_start(now);
 		now += 12_000_000;
 		shared.note_present(now);
-		assert!(!shared.gates_present());
+		assert!(!shared.gate_or_resync());
 		// Back to 2 ms frames, unheld while the peak decays: four presents per
 		// tick, each tick's `frame_ready` answering one of them.
 		let mut unheld = 0;
@@ -327,7 +328,7 @@ mod tests {
 			shared.note_frame_start(now);
 			now += 2_000_000;
 			shared.note_present(now);
-			if shared.gates_present() {
+			if shared.gate_or_resync() {
 				break;
 			}
 			unheld += 1;

@@ -266,7 +266,7 @@ fn is_held(data: &SwapchainData, mode: vk::PresentModeKHR) -> bool {
 /// time (see `ferriscope_swapchain_v1.frame_ready`), so it starts rendering
 /// right after a tick instead of running ahead of the display.
 fn wait_for_frame_ready(data: &SwapchainData, timeout_ns: u64) {
-	if timeout_ns == 0 || !data.shared.gates_present() {
+	if timeout_ns == 0 || !data.shared.gate_or_resync() {
 		return;
 	}
 	let budget = std::time::Duration::from_nanos((2 * data.shared.refresh_cycle_ns()).min(timeout_ns));

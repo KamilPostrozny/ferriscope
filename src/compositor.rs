@@ -183,8 +183,13 @@ impl Compositor {
 		let thread = std::thread::Builder::new()
 			.name("ferriscope-compositor".to_string())
 			.spawn(move || {
-				// First, so the embedder can set the thread's scheduling before
-				// the compositor starts Xwayland or any thread of its own.
+				// For `Compositor::thread_id`. Nothing orders the embedder's use
+				// of it against this thread's setup: Xwayland and this thread's
+				// own helpers may start before or after the embedder sets a
+				// policy. That is safe because Moonshine sets its `SCHED_RR`
+				// with `SCHED_RESET_ON_FORK`, so whatever this thread forks
+				// afterwards starts on `SCHED_OTHER`, and whatever it forked
+				// before never had the policy.
 				let _ = thread_id_tx.send(current_thread_id());
 				// Hold a sender for the whole run. The release channel closes
 				// when its last sender drops and the shell reads that as the
