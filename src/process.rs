@@ -8,6 +8,9 @@
 //! `app-steam-app<appid>-<pid>.scope` in its cgroup, then from the
 //! `reaper SteamLaunch AppId=<appid>` process it runs under. A Proton game with
 //! `PROTON_ENABLE_WAYLAND=1` is such a window.
+//!
+//! Also the compositor's own Xwayland child, found the same way
+//! ([`xwayland_child`]) so the session can stop it.
 
 use std::fs;
 
@@ -90,16 +93,9 @@ fn app_id_from_reaper(pid: u32, stat: impl Fn(u32) -> Option<String>, cmdline: i
 		let Some(line) = stat(next) else {
 			break;
 		};
-		// `pid (comm) state ppid ...`; the name may itself contain ')'.
-		let (Some(open), Some(close)) = (line.find('('), line.rfind(')')) else {
+		let Some((name, parent)) = name_and_parent(&line) else {
 			break;
 		};
-		let name = &line[open + 1..close];
-		let parent = line[close + 1..]
-			.split_whitespace()
-			.nth(1)
-			.and_then(|ppid| ppid.parse::<i64>().ok())
-			.unwrap_or(-1);
 		if name == "reaper"
 			&& let Some(app_id) = cmdline(next).and_then(|cmdline| steam_launch_app_id(&cmdline))
 		{
@@ -138,6 +134,55 @@ fn steam_launch_app_id(cmdline: &[u8]) -> Option<u32> {
 		}
 	}
 	app_id
+}
+
+/// The name and parent pid of a `/proc/<pid>/stat` line.
+fn name_and_parent(line: &str) -> Option<(&str, i64)> {
+	// `pid (comm) state ppid ...`; the name may itself contain ')'.
+	let (open, close) = (line.find('(')?, line.rfind(')')?);
+	let parent = line
+		.get(close + 1..)?
+		.split_whitespace()
+		.nth(1)
+		.and_then(|ppid| ppid.parse::<i64>().ok())
+		.unwrap_or(-1);
+	Some((line.get(open + 1..close)?, parent))
+}
+
+/// The pid of the `Xwayland` this process started for X display `display`,
+/// live or not yet reaped.
+///
+/// smithay's `XWayland::spawn` keeps the child's handle to itself, so it is
+/// found by its command line, which smithay starts with `Xwayland :<display>`.
+/// The display number is unique while the session holds its X lock.
+pub(crate) fn xwayland_child(display: u32) -> Option<u32> {
+	let pids = fs::read_dir("/proc")
+		.ok()?
+		.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok());
+	find_xwayland(
+		std::process::id(),
+		display,
+		pids,
+		|pid| fs::read_to_string(format!("/proc/{pid}/stat")).ok(),
+		|pid| fs::read(format!("/proc/{pid}/cmdline")).ok(),
+	)
+}
+
+/// [`xwayland_child`] over `pids`, with `stat` and `cmdline` reading
+/// `/proc/<pid>/stat` and `/proc/<pid>/cmdline`.
+fn find_xwayland(
+	parent: u32,
+	display: u32,
+	pids: impl IntoIterator<Item = u32>,
+	stat: impl Fn(u32) -> Option<String>,
+	cmdline: impl Fn(u32) -> Option<Vec<u8>>,
+) -> Option<u32> {
+	let display = format!(":{display}");
+	pids.into_iter().find(|&pid| {
+		stat(pid).is_some_and(|line| {
+			name_and_parent(&line).is_some_and(|(name, ppid)| name == "Xwayland" && ppid == i64::from(parent))
+		}) && cmdline(pid).is_some_and(|cmdline| cmdline.split(|byte| *byte == 0).nth(1) == Some(display.as_bytes()))
+	})
 }
 
 #[cfg(test)]
@@ -251,5 +296,45 @@ mod tests {
 	fn a_process_outside_steam_has_no_app() {
 		let processes = table(&[(30, "vkcube", 1, &["vkcube"])]);
 		assert_eq!(lookup(&processes, 30), 0);
+	}
+
+	fn find(processes: &HashMap<u32, (String, u32, Vec<u8>)>, parent: u32, display: u32) -> Option<u32> {
+		let mut pids: Vec<u32> = processes.keys().copied().collect();
+		pids.sort_unstable();
+		find_xwayland(
+			parent,
+			display,
+			pids,
+			|pid| {
+				processes
+					.get(&pid)
+					.map(|(comm, ppid, _)| format!("{pid} ({comm}) S {ppid} 0 0"))
+			},
+			|pid| processes.get(&pid).map(|(_, _, cmdline)| cmdline.clone()),
+		)
+	}
+
+	#[test]
+	fn the_xwayland_this_process_spawned_for_the_display_is_found() {
+		let processes = table(&[
+			(40, "Xwayland", 7, &["Xwayland", ":0", "-rootless", "-terminate"]),
+			(41, "Xwayland", 7, &["Xwayland", ":3", "-rootless", "-terminate"]),
+			(42, "vkcube", 7, &["vkcube"]),
+		]);
+		assert_eq!(find(&processes, 7, 3), Some(41));
+		assert_eq!(find(&processes, 7, 0), Some(40));
+	}
+
+	#[test]
+	fn another_parents_xwayland_or_display_is_not_ours() {
+		let processes = table(&[
+			// The desktop's Xwayland on the same display number, under niri.
+			(50, "Xwayland", 9, &["Xwayland", ":3", "-rootless"]),
+			// Ours, on another display.
+			(51, "Xwayland", 7, &["Xwayland", ":30", "-rootless"]),
+			// A child of ours named otherwise, with the same argument.
+			(52, "Xvfb", 7, &["Xvfb", ":3"]),
+		]);
+		assert_eq!(find(&processes, 7, 3), None);
 	}
 }
