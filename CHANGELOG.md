@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CompositorHandles::frame_clock`: an embedder steers the frame-callback grid with bounded `FrameClockCorrection`s (a period within 1% of nominal and a relative phase shift of at most half a period, applied at most 250 µs per frame). Without a correction for one second the grid goes back to the nominal period.
 - `ferriscope-wsi` holds an application at the end of `vkQueuePresentKHR` until the compositor's next tick in every present mode, not only FIFO: a game with VSync off (MAILBOX, IMMEDIATE) renders one frame per tick on the steered frame clock instead of unbounded. `FERRISCOPE_WSI_HOLD=fifo` holds FIFO only (the old behaviour), `FERRISCOPE_WSI_HOLD=off` nothing. `ferriscope_swapchain_v1` version 2 sends `frame_ready` at every tick for non-FIFO swapchains bound at version 2 (one bound at version 1 gets it for FIFO only); the layer holds those only on a version 2 compositor.
 - `WsiHold`: `FERRISCOPE_WSI_HOLD`'s parser, compiled from the same file by `ferriscope-wsi`, so an embedder reading an application's environment (Moonshine's forced GL sync opt-out) agrees with the layer on which values opt out.
+- `Compositor::thread_id`: the compositor thread's Linux thread ID, captured before the compositor starts Xwayland or a thread of its own, so an embedder can put that one thread on a real-time policy with reset-on-fork instead of matching thread names (threads it starts inherit the name `ferriscope-comp`).
 
 ### Changed
 

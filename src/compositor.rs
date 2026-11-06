@@ -158,6 +158,7 @@ impl StopHandle {
 /// The producer end: owns the compositor thread and its stop signal.
 pub struct Compositor {
 	thread: Option<std::thread::JoinHandle<Result<()>>>,
+	thread_id: Option<u32>,
 	handle: StopHandle,
 }
 
@@ -175,12 +176,16 @@ impl Compositor {
 		let frame_clock = FrameClockSender::new(frame_clock_tx, frame_clock::nominal_period(config.rate));
 		let (ready_tx, ready_rx) = mpsc::sync_channel::<Ready>(1);
 		let (signal_tx, signal_rx) = mpsc::sync_channel::<LoopSignal>(1);
+		let (thread_id_tx, thread_id_rx) = mpsc::sync_channel::<Option<u32>>(1);
 		let stop = Arc::new(AtomicBool::new(false));
 		let thread_stop = Arc::clone(&stop);
 
 		let thread = std::thread::Builder::new()
 			.name("ferriscope-compositor".to_string())
 			.spawn(move || {
+				// First, so the embedder can set the thread's scheduling before
+				// the compositor starts Xwayland or any thread of its own.
+				let _ = thread_id_tx.send(current_thread_id());
 				// Hold a sender for the whole run. The release channel closes
 				// when its last sender drops and the shell reads that as the
 				// consumer going away; no consumer sender exists any more, so
@@ -208,6 +213,7 @@ impl Compositor {
 			})
 			.map_err(|e| Error::Wayland(format!("spawn compositor thread: {e}")))?;
 
+		let thread_id = thread_id_rx.recv().ok().flatten();
 		let signal = match signal_rx.recv() {
 			Ok(signal) => signal,
 			// The thread died before handing over its signal; surface the cause.
@@ -223,6 +229,7 @@ impl Compositor {
 		Ok((
 			Compositor {
 				thread: Some(thread),
+				thread_id,
 				handle: StopHandle { signal, stop },
 			},
 			CompositorHandles {
@@ -252,6 +259,17 @@ impl Compositor {
 	/// A handle that stops this compositor from another thread.
 	pub fn stop_handle(&self) -> StopHandle {
 		self.handle.clone()
+	}
+
+	/// The compositor thread's Linux thread ID (`gettid`), so an embedder can
+	/// set its scheduling policy, such as a real-time one with reset-on-fork.
+	/// `None` when `/proc/thread-self` couldn't be read.
+	///
+	/// It is the one thread that renders and delivers every frame. Threads and
+	/// processes it starts (Xwayland, the hosted application) are not part of
+	/// it.
+	pub fn thread_id(&self) -> Option<u32> {
+		self.thread_id
 	}
 
 	fn join(&mut self) -> Result<()> {
@@ -289,6 +307,17 @@ pub fn run(config: CompositorConfig) -> Result<()> {
 	let result = compositor.wait();
 	drop(handles);
 	result
+}
+
+/// The calling thread's Linux thread ID, read from `/proc/thread-self`
+/// (`<pid>/task/<tid>`).
+fn current_thread_id() -> Option<u32> {
+	std::fs::read_link("/proc/thread-self")
+		.ok()?
+		.file_name()?
+		.to_str()?
+		.parse()
+		.ok()
 }
 
 /// Build the sink for the configured output.
@@ -464,6 +493,39 @@ mod tests {
 				.contains(&("STEAM_GAME_DISPLAY_0".to_string(), ":3".to_string()))
 		);
 		assert!(!ready.env.iter().any(|(key, _)| key.starts_with("STEAM_GAMESCOPE_")));
+	}
+
+	#[test]
+	fn current_thread_id_is_the_calling_threads() {
+		let (tid, comm) = std::thread::Builder::new()
+			.name("thread-id-probe".to_string())
+			.spawn(|| {
+				let tid = current_thread_id().expect("thread id");
+				let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).expect("comm");
+				(tid, comm)
+			})
+			.unwrap()
+			.join()
+			.unwrap();
+		assert_eq!(comm.trim_end(), "thread-id-probe");
+		assert_ne!(Some(tid), current_thread_id());
+	}
+
+	/// Launches the compositor, which needs a render node.
+	#[test]
+	#[ignore = "needs a render node"]
+	fn launch_reports_the_compositor_threads_id() {
+		let config = CompositorConfig {
+			xwayland: false,
+			..CompositorConfig::default()
+		};
+		let (compositor, handles) = Compositor::launch(config).expect("launch");
+		let tid = compositor.thread_id().expect("thread id");
+		let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).expect("comm");
+		// Linux keeps 15 bytes of a thread's name.
+		assert_eq!(comm.trim_end(), "ferriscope-comp");
+		compositor.stop().expect("stop");
+		drop(handles);
 	}
 
 	#[cfg(feature = "test-support")]
