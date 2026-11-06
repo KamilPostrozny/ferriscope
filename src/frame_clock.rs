@@ -12,9 +12,9 @@
 
 use std::sync::{
 	Arc,
-	atomic::{AtomicU32, Ordering},
+	atomic::{AtomicU32, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smithay::reexports::calloop;
 
@@ -82,8 +82,35 @@ pub(crate) fn max_phase_shift_ns(nominal: Duration) -> u64 {
 #[derive(Clone)]
 pub struct FrameClockSender {
 	sender: calloop::channel::Sender<FrameClockCommand>,
-	applied: Arc<AtomicU32>,
+	acknowledgements: Arc<Acknowledgements>,
 	nominal: Duration,
+}
+
+/// Which consumer steers the clock, and the last correction installed.
+///
+/// Corrections carry the consumer that sent them, so one installed for an
+/// earlier consumer is never reported to a later one, even when it is installed
+/// while the consumer changes.
+#[derive(Default)]
+struct Acknowledgements {
+	consumer: AtomicU32,
+	/// The consumer in the high half, its sequence in the low half.
+	applied: AtomicU64,
+}
+
+impl Acknowledgements {
+	fn consumer(&self) -> u32 {
+		self.consumer.load(Ordering::Acquire)
+	}
+
+	fn last_applied(&self) -> u32 {
+		let applied = self.applied.load(Ordering::Acquire);
+		if (applied >> 32) as u32 == self.consumer() {
+			applied as u32
+		} else {
+			0
+		}
+	}
 }
 
 impl FrameClockSender {
@@ -91,7 +118,7 @@ impl FrameClockSender {
 		Self {
 			sender,
 			nominal,
-			applied: Arc::new(AtomicU32::new(0)),
+			acknowledgements: Arc::default(),
 		}
 	}
 
@@ -100,37 +127,61 @@ impl FrameClockSender {
 		self.nominal
 	}
 
-	/// The sequence last installed by the compositor thread (zero before any).
-	/// Queuing a correction does not acknowledge it.
+	/// The sequence last installed by the compositor thread for the current
+	/// consumer (zero before any). Queuing a correction does not acknowledge it.
 	pub fn last_applied(&self) -> u32 {
-		self.applied.load(Ordering::Acquire)
+		self.acknowledgements.last_applied()
+	}
+
+	/// Start steering for a new consumer, whose sequences start over.
+	///
+	/// Corrections sent before this are no longer installed, and
+	/// [`Self::last_applied`] is zero until one sent after it is.
+	pub fn new_consumer(&self) {
+		self.acknowledgements.consumer.fetch_add(1, Ordering::AcqRel);
 	}
 
 	/// Apply a correction from the next frame callback on.
 	///
 	/// Fails, and changes nothing, when the correction is out of its bounds
-	/// ([`FrameClockCorrection::check`]) or the compositor has shut down.
+	/// ([`FrameClockCorrection::check`]) or the compositor has shut down. A
+	/// correction still queued after [`CORRECTION_TIMEOUT`] is dropped
+	/// unapplied: the grid has gone back to its nominal period by then.
 	pub fn send(&self, sequence: u32, correction: FrameClockCorrection) -> Result<()> {
 		correction.check(self.nominal)?;
 		self.sender
 			.send(FrameClockCommand {
 				correction,
 				sequence,
-				applied: Arc::clone(&self.applied),
+				consumer: self.acknowledgements.consumer(),
+				sent_at: Instant::now(),
+				acknowledgements: Arc::clone(&self.acknowledgements),
 			})
 			.map_err(|_| Error::FrameClock("frame clock channel closed".into()))
 	}
 }
 
 pub(crate) struct FrameClockCommand {
-	pub correction: FrameClockCorrection,
+	correction: FrameClockCorrection,
 	sequence: u32,
-	applied: Arc<AtomicU32>,
+	consumer: u32,
+	sent_at: Instant,
+	acknowledgements: Arc<Acknowledgements>,
 }
 
 impl FrameClockCommand {
+	/// The correction to install at `now`; `None` when it was sent for an
+	/// earlier consumer, or [`CORRECTION_TIMEOUT`] or longer ago.
+	pub(crate) fn installable(&self, now: Instant) -> Option<FrameClockCorrection> {
+		let current = self.consumer == self.acknowledgements.consumer();
+		let fresh = now.saturating_duration_since(self.sent_at) < CORRECTION_TIMEOUT;
+		(current && fresh).then_some(self.correction)
+	}
+
+	/// Report the correction installed.
 	pub(crate) fn acknowledge(self) {
-		self.applied.store(self.sequence, Ordering::Release);
+		let applied = u64::from(self.consumer) << 32 | u64::from(self.sequence);
+		self.acknowledgements.applied.store(applied, Ordering::Release);
 	}
 }
 
@@ -211,5 +262,39 @@ mod tests {
 		assert_eq!(sender.last_applied(), 0);
 		rx.try_recv().unwrap().acknowledge();
 		assert_eq!(sender.last_applied(), 7);
+	}
+
+	#[test]
+	fn a_new_consumer_sees_no_acknowledgement_of_an_earlier_ones_corrections() {
+		let (sender, rx) = sender();
+		sender.send(5, correction(10_000, 100)).unwrap();
+		rx.try_recv().unwrap().acknowledge();
+		sender.new_consumer();
+		assert_eq!(sender.last_applied(), 0);
+		sender.send(1, correction(10_000, 100)).unwrap();
+		rx.try_recv().unwrap().acknowledge();
+		assert_eq!(sender.last_applied(), 1);
+	}
+
+	#[test]
+	fn a_correction_queued_for_an_earlier_consumer_is_not_installed() {
+		let (sender, rx) = sender();
+		sender.send(5, correction(10_000, 100)).unwrap();
+		sender.new_consumer();
+		let command = rx.try_recv().unwrap();
+		assert_eq!(command.installable(Instant::now()), None);
+		// Installed just before the consumer changed, acknowledged just after.
+		command.acknowledge();
+		assert_eq!(sender.last_applied(), 0);
+	}
+
+	#[test]
+	fn a_correction_queued_longer_than_the_timeout_is_not_installed() {
+		let (sender, rx) = sender();
+		sender.send(3, correction(10_100, -250)).unwrap();
+		let command = rx.try_recv().unwrap();
+		let sent = Instant::now();
+		assert_eq!(command.installable(sent), Some(correction(10_100, -250)));
+		assert_eq!(command.installable(sent + CORRECTION_TIMEOUT), None);
 	}
 }
