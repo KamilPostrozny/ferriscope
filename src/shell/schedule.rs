@@ -388,9 +388,11 @@ impl Scheduler {
 	}
 }
 
-/// Slack on the FPS-limit schedule (`steamcompmgr.cpp:6743`: `now + 200'000ull
-/// < ulSchedule`).
-const FPS_LIMIT_FUDGE: Duration = Duration::from_micros(200);
+/// Slack on the FPS-limit schedule: gamescope's 0.2 ms (`steamcompmgr.cpp:6743`:
+/// `now + 200'000ull < ulSchedule`) plus one phase step, since a steered grid
+/// may bring a tick that much earlier. Without it a cap at the session rate
+/// would skip a callback on every negative step.
+const FPS_LIMIT_FUDGE: Duration = Duration::from_micros(200).saturating_add(MAX_PHASE_STEP);
 
 /// Whether the FPS limiter covers a window (`steamcompmgr_window_should_limit_fps`,
 /// `steamcompmgr.cpp:1475`): the Steam UI and the overlays are exempt
@@ -969,7 +971,7 @@ mod tests {
 		// 30 Hz: one callback per 33.3 ms.
 		assert!(!frame_callback_due(30, Some(t0), t0 + ms(16)));
 		assert!(frame_callback_due(30, Some(t0), t0 + ms(34)));
-		// Within the 0.2 ms fudge of the schedule counts as due.
+		// Within the fudge of the schedule counts as due.
 		assert!(frame_callback_due(30, Some(t0), t0 + Duration::from_micros(33_200)));
 	}
 
@@ -988,6 +990,25 @@ mod tests {
 			}
 		}
 		assert_eq!(sent, 30);
+	}
+
+	#[test]
+	fn a_limit_at_the_session_rate_passes_every_steered_tick() {
+		// 120 Hz ticks, 120 Hz limit, on a grid a correction shortened as far as it
+		// may: the period by 1% and each tick by a whole phase step.
+		let t0 = Instant::now();
+		let cycle = Duration::from_secs_f64(1.0 / 120.0);
+		let tick = cycle - cycle / 100 - MAX_PHASE_STEP;
+		let mut last = None;
+		let mut sent = 0;
+		for n in 0..120u32 {
+			let now = t0 + tick * n;
+			if frame_callback_due(120, last, now) {
+				last = Some(now);
+				sent += 1;
+			}
+		}
+		assert_eq!(sent, 120);
 	}
 
 	#[test]
