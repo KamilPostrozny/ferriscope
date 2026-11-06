@@ -382,7 +382,7 @@ impl Client {
 			shm: globals.bind(&qh, 1..=1, ()).expect("wl_shm"),
 			xwayland: globals.bind(&qh, 1..=1, ()).expect("gamescope_xwayland"),
 			factory: globals.bind(&qh, 1..=1, ()).expect("gamescope_swapchain_factory_v2"),
-			ferriscope_factory: globals.bind(&qh, 1..=1, ()).expect("ferriscope_swapchain_factory_v1"),
+			ferriscope_factory: globals.bind(&qh, 1..=2, ()).expect("ferriscope_swapchain_factory_v1"),
 			observed: Observed::default(),
 		};
 		queue.roundtrip(&mut state).expect("roundtrip");
@@ -690,6 +690,50 @@ fn ferriscope_swapchain_override_replaces_the_content_and_reports_back() {
 		client.state.observed.retired,
 		"replacing the override did not retire the first swapchain"
 	);
+	drop(client.conn);
+}
+
+/// A MAILBOX or IMMEDIATE swapchain gets `frame_ready` at the compositor's
+/// ticks, as an idle FIFO one does, so the layer can hold a game with VSync off
+/// to one frame per tick (protocol version 2).
+#[test]
+#[ignore = "requires GPU and Xwayland"]
+fn a_mailbox_or_immediate_swapchain_gets_frame_ready_every_tick() {
+	let session = Session::start("frame-ready");
+	assert_x11_content(&session);
+
+	let mut client = session.wayland_client();
+	assert_eq!(wayland_client::Proxy::version(&client.state.ferriscope_factory), 2);
+	let qh = client.qh();
+	for (mode, name) in [(1, "MAILBOX"), (0, "IMMEDIATE")] {
+		let surface = client.solid_surface(OVERRIDE_COLOR);
+		let swapchain = client.state.ferriscope_factory.create_swapchain(&surface, &qh, ());
+		swapchain.swapchain_feedback(3, 37, 0, 1, 1, 1, "test-engine".to_string());
+		swapchain.set_present_mode(mode);
+		swapchain.override_window_content(session.server_id(), session.window);
+		surface.commit();
+		client.roundtrip();
+		assert!(
+			wait_for_solid(&session.record_dir, [0, 0xff, 0], FRAME_TIMEOUT),
+			"the {name} swapchain did not become the window's content"
+		);
+
+		// About 30 ticks at 60 Hz, with no further commit.
+		client.state.observed.frame_ready = 0;
+		let start = Instant::now();
+		while start.elapsed() < Duration::from_millis(500) {
+			thread::sleep(Duration::from_millis(20));
+			client.roundtrip();
+		}
+		let ready = client.state.observed.frame_ready;
+		assert!(
+			(15..=40).contains(&ready),
+			"{name}: {ready} frame_ready in 500 ms, expected one per 60 Hz tick"
+		);
+		swapchain.destroy();
+		surface.destroy();
+		client.roundtrip();
+	}
 	drop(client.conn);
 }
 

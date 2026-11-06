@@ -25,7 +25,7 @@
     DEALINGS IN THE SOFTWARE.
   </copyright>
 
-  <description summary="ferriscope swapchain protocol, version 1">
+  <description summary="ferriscope swapchain protocol, version 2">
     This is a private ferriscope protocol spoken by the ferriscope Vulkan WSI
     layer (VK_LAYER_FERRISCOPE_wsi). Regular Wayland clients must not use it.
 
@@ -43,7 +43,7 @@
     interface name (..._v2), not a new version of these.
   </description>
 
-  <interface name="ferriscope_swapchain_factory_v1" version="1">
+  <interface name="ferriscope_swapchain_factory_v1" version="2">
     <request name="destroy" type="destructor"></request>
 
     <request name="create_swapchain">
@@ -82,7 +82,7 @@
     </event>
   </interface>
 
-  <interface name="ferriscope_swapchain_v1" version="1">
+  <interface name="ferriscope_swapchain_v1" version="2">
     <request name="destroy" type="destructor"></request>
 
     <request name="override_window_content">
@@ -196,6 +196,11 @@
         held waiting for a tick: a frame the application starts now, and
         presents when done, is taken at the next tick at the latest, without
         queueing behind others.
+
+        From version 2 the compositor also sends it at every tick for a
+        swapchain in any other present mode (set_present_mode other than 2,
+        such as MAILBOX or IMMEDIATE). Those commits are never held, so every
+        tick has room for one.
 
         A layer may use it to start the application's next frame no earlier
         than that, instead of letting it render ahead of the display, which

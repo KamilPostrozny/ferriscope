@@ -18,6 +18,13 @@
 //! `steamcompmgr.cpp:7987`). The tick stands in for the vblank here too, with
 //! one difference: gamescope latches the first commit at the next vblank,
 //! ferriscope applies it at once, so only commits beyond one per tick wait.
+//!
+//! A tick that leaves a swapchain room for its next frame sends it
+//! `ferriscope_swapchain_v1.frame_ready`, and the ferriscope layer holds the
+//! game until then. MAILBOX and IMMEDIATE swapchains are not gated, so they
+//! get it at every tick: a held game with VSync off renders one frame per tick
+//! and keeps latest-wins delivery, and one the layer does not hold (it renders
+//! for most of a refresh) is not queued behind its own frames.
 
 use std::{
 	collections::{HashSet, VecDeque},
@@ -136,19 +143,33 @@ pub(in crate::shell) fn gate_wsi_fifo(surface: &WlSurface) {
 struct FifoTick {
 	/// A held commit was released.
 	released: bool,
-	/// The surface has a FIFO queue, nothing is held and this tick released
-	/// nothing: a frame started now is taken on arrival (`frame_ready`).
+	/// Nothing of the surface is held and this tick released nothing: a frame
+	/// started now is taken on arrival (`frame_ready`).
 	has_room: bool,
 }
 
-/// Advance `surface`'s WSI-FIFO queue by one tick: release the oldest held
-/// commit, if any.
+/// Advance a surface's WSI-FIFO queue by one tick: release the oldest held
+/// commit, if any. A swapchain in another present mode (MAILBOX, IMMEDIATE)
+/// is never gated, so every tick has room for it: the layer holds such an
+/// application for `frame_ready` too, one frame per tick, and its commits are
+/// still taken latest-wins.
+fn tick_surface(fifo: Option<&mut WsiFifo>, present_mode: Option<u32>) -> FifoTick {
+	match (fifo, present_mode) {
+		(Some(fifo), _) => fifo.tick(),
+		(None, Some(mode)) if mode != VK_PRESENT_MODE_FIFO_KHR => FifoTick {
+			released: false,
+			has_room: true,
+		},
+		(None, _) => FifoTick::default(),
+	}
+}
+
+/// Advance `surface`'s WSI-FIFO queue by one tick ([`tick_surface`]).
 fn tick_wsi_fifo(surface: &WlSurface) -> FifoTick {
+	let present_mode = swapchain::present_mode(surface);
 	with_states(surface, |states| {
-		let Some(cell) = states.data_map.get::<WsiFifoCell>() else {
-			return FifoTick::default();
-		};
-		cell.lock().unwrap().tick()
+		let mut fifo = states.data_map.get::<WsiFifoCell>().map(|cell| cell.lock().unwrap());
+		tick_surface(fifo.as_deref_mut(), present_mode)
 	})
 }
 
@@ -230,6 +251,9 @@ impl FerriscopeState {
 mod tests {
 	use super::*;
 
+	const VK_PRESENT_MODE_IMMEDIATE_KHR: u32 = 0;
+	const VK_PRESENT_MODE_MAILBOX_KHR: u32 = 1;
+
 	#[test]
 	fn a_frame_presented_after_frame_ready_is_taken_on_arrival() {
 		let mut fifo = WsiFifo::default();
@@ -265,5 +289,36 @@ mod tests {
 		assert!(fifo.tick().released);
 		assert!(second.load(Ordering::Acquire));
 		assert!(fifo.tick().has_room);
+	}
+
+	#[test]
+	fn a_mailbox_or_immediate_swapchain_has_room_at_every_tick() {
+		// Not gated, so nothing is ever held: each tick lets the layer start
+		// the application's next frame.
+		for mode in [VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR] {
+			for _ in 0..3 {
+				let tick = tick_surface(None, Some(mode));
+				assert!(tick.has_room && !tick.released, "mode {mode}");
+			}
+		}
+	}
+
+	#[test]
+	fn a_surface_without_a_swapchain_mode_gets_no_frame_ready() {
+		assert_eq!(tick_surface(None, None), FifoTick::default());
+		// A FIFO swapchain's room comes from its queue, made by its first
+		// commit.
+		assert_eq!(tick_surface(None, Some(VK_PRESENT_MODE_FIFO_KHR)), FifoTick::default());
+	}
+
+	#[test]
+	fn a_fifo_queue_drains_after_the_swapchain_turns_to_mailbox() {
+		let mut fifo = WsiFifo::default();
+		assert!(fifo.admit().is_none());
+		let held = fifo.admit().expect("held");
+		let tick = tick_surface(Some(&mut fifo), Some(VK_PRESENT_MODE_MAILBOX_KHR));
+		assert!(tick.released && !tick.has_room);
+		assert!(held.load(Ordering::Acquire));
+		assert!(tick_surface(Some(&mut fifo), Some(VK_PRESENT_MODE_MAILBOX_KHR)).has_room);
 	}
 }
