@@ -32,6 +32,13 @@ use wayland_server::{
 
 use crate::shell::FerriscopeState;
 
+/// `VK_PRESENT_MODE_FIFO_KHR`, as `set_present_mode` carries it.
+pub(crate) const VK_PRESENT_MODE_FIFO_KHR: u32 = 2;
+
+/// The `ferriscope_swapchain_v1` version from which `frame_ready` also goes to
+/// a swapchain in a present mode other than FIFO.
+const NON_FIFO_FRAME_READY_SINCE: u32 = 2;
+
 macro_rules! protocol_bindings {
 	($module:ident, $xml:literal) => {
 		/// Server bindings generated at compile time by the `wayland-scanner`
@@ -163,9 +170,12 @@ impl SwapchainObject {
 	}
 
 	/// `frame_ready`: a frame started now is taken in time (native protocol only;
-	/// a gamescope layer has no such event).
-	fn frame_ready(&self) {
-		if let Self::Ferriscope(object) = self {
+	/// a gamescope layer has no such event). A swapchain whose present mode is
+	/// not FIFO gets it only from [`NON_FIFO_FRAME_READY_SINCE`].
+	fn frame_ready(&self, present_mode: Option<u32>) {
+		if let Self::Ferriscope(object) = self
+			&& (present_mode == Some(VK_PRESENT_MODE_FIFO_KHR) || object.version() >= NON_FIFO_FRAME_READY_SINCE)
+		{
 			object.frame_ready();
 		}
 	}
@@ -271,11 +281,12 @@ pub fn send_refresh_cycle(surface: &WlSurface, nanos: u64) {
 	});
 }
 
-/// Tell every swapchain on `surface` that a frame started now is taken in time.
+/// Tell every swapchain on `surface` that a frame started now is taken in time
+/// (one bound before version 2 only while its present mode is FIFO).
 pub fn send_frame_ready(surface: &WlSurface) {
 	with_swapchain_surface(surface, |wsi| {
 		for object in &wsi.objects {
-			object.frame_ready();
+			object.frame_ready(wsi.present_mode);
 		}
 	});
 }

@@ -21,10 +21,11 @@
 //!
 //! A tick that leaves a swapchain room for its next frame sends it
 //! `ferriscope_swapchain_v1.frame_ready`, and the ferriscope layer holds the
-//! game until then. MAILBOX and IMMEDIATE swapchains are not gated, so they
-//! get it at every tick: a held game with VSync off renders one frame per tick
-//! and keeps latest-wins delivery, and one the layer does not hold (it renders
-//! for most of a refresh) is not queued behind its own frames.
+//! game until then. MAILBOX and IMMEDIATE swapchains are not gated, so from
+//! protocol version 2 they get it at every tick: a held game with VSync off
+//! renders one frame per tick and keeps latest-wins delivery, and one the
+//! layer does not hold (it renders for most of a refresh) is not queued behind
+//! its own frames.
 
 use std::{
 	collections::{HashSet, VecDeque},
@@ -45,10 +46,10 @@ use smithay::{
 	},
 };
 
-use crate::{shell::FerriscopeState, swapchain};
-
-/// `VK_PRESENT_MODE_FIFO_KHR`.
-const VK_PRESENT_MODE_FIFO_KHR: u32 = 2;
+use crate::{
+	shell::FerriscopeState,
+	swapchain::{self, VK_PRESENT_MODE_FIFO_KHR},
+};
 
 /// A WSI-FIFO commit held until a tick releases it.
 struct TickBlocker(Arc<AtomicBool>);

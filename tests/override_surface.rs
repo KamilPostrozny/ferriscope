@@ -274,10 +274,18 @@ impl Session {
 
 	/// Connect a Wayland client to the compositor.
 	fn wayland_client(&self) -> Client {
+		self.wayland_client_at(2)
+	}
+
+	/// A client bound to `ferriscope_swapchain_factory_v1` at `ferriscope_version`.
+	fn wayland_client_at(&self, ferriscope_version: u32) -> Client {
 		let runtime_dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is set");
 		let stream = UnixStream::connect(Path::new(&runtime_dir).join(&self.ready.wayland_display))
 			.expect("connect to the compositor socket");
-		Client::new(WlConnection::from_socket(stream).expect("wayland connection"))
+		Client::new(
+			WlConnection::from_socket(stream).expect("wayland connection"),
+			ferriscope_version,
+		)
 	}
 }
 
@@ -374,7 +382,7 @@ struct ClientState {
 }
 
 impl Client {
-	fn new(conn: WlConnection) -> Self {
+	fn new(conn: WlConnection, ferriscope_version: u32) -> Self {
 		let (globals, mut queue) = registry_queue_init::<ClientState>(&conn).expect("registry");
 		let qh = queue.handle();
 		let mut state = ClientState {
@@ -382,7 +390,9 @@ impl Client {
 			shm: globals.bind(&qh, 1..=1, ()).expect("wl_shm"),
 			xwayland: globals.bind(&qh, 1..=1, ()).expect("gamescope_xwayland"),
 			factory: globals.bind(&qh, 1..=1, ()).expect("gamescope_swapchain_factory_v2"),
-			ferriscope_factory: globals.bind(&qh, 1..=2, ()).expect("ferriscope_swapchain_factory_v1"),
+			ferriscope_factory: globals
+				.bind(&qh, ferriscope_version..=ferriscope_version, ())
+				.expect("ferriscope_swapchain_factory_v1"),
 			observed: Observed::default(),
 		};
 		queue.roundtrip(&mut state).expect("roundtrip");
@@ -693,6 +703,37 @@ fn ferriscope_swapchain_override_replaces_the_content_and_reports_back() {
 	drop(client.conn);
 }
 
+/// How many `frame_ready` a ferriscope swapchain presenting in `mode` gets over
+/// 500 ms (about 30 ticks at 60 Hz) once it shows the window's content, with no
+/// further commit.
+fn frame_ready_in_500ms(session: &Session, client: &mut Client, mode: u32, name: &str) -> u32 {
+	let qh = client.qh();
+	let surface = client.solid_surface(OVERRIDE_COLOR);
+	let swapchain = client.state.ferriscope_factory.create_swapchain(&surface, &qh, ());
+	swapchain.swapchain_feedback(3, 37, 0, 1, 1, 1, "test-engine".to_string());
+	swapchain.override_window_content(session.server_id(), session.window);
+	// As the layer does at every present: the mode applies to the next commit.
+	swapchain.set_present_mode(mode);
+	surface.commit();
+	client.roundtrip();
+	assert!(
+		wait_for_solid(&session.record_dir, [0, 0xff, 0], FRAME_TIMEOUT),
+		"the {name} swapchain did not become the window's content"
+	);
+
+	client.state.observed.frame_ready = 0;
+	let start = Instant::now();
+	while start.elapsed() < Duration::from_millis(500) {
+		thread::sleep(Duration::from_millis(20));
+		client.roundtrip();
+	}
+	let ready = client.state.observed.frame_ready;
+	swapchain.destroy();
+	surface.destroy();
+	client.roundtrip();
+	ready
+}
+
 /// A MAILBOX or IMMEDIATE swapchain gets `frame_ready` at the compositor's
 /// ticks, as an idle FIFO one does, so the layer can hold a game with VSync off
 /// to one frame per tick (protocol version 2).
@@ -704,35 +745,34 @@ fn a_mailbox_or_immediate_swapchain_gets_frame_ready_every_tick() {
 
 	let mut client = session.wayland_client();
 	assert_eq!(wayland_client::Proxy::version(&client.state.ferriscope_factory), 2);
-	let qh = client.qh();
 	for (mode, name) in [(1, "MAILBOX"), (0, "IMMEDIATE")] {
-		let surface = client.solid_surface(OVERRIDE_COLOR);
-		let swapchain = client.state.ferriscope_factory.create_swapchain(&surface, &qh, ());
-		swapchain.swapchain_feedback(3, 37, 0, 1, 1, 1, "test-engine".to_string());
-		swapchain.set_present_mode(mode);
-		swapchain.override_window_content(session.server_id(), session.window);
-		surface.commit();
-		client.roundtrip();
-		assert!(
-			wait_for_solid(&session.record_dir, [0, 0xff, 0], FRAME_TIMEOUT),
-			"the {name} swapchain did not become the window's content"
-		);
-
-		// About 30 ticks at 60 Hz, with no further commit.
-		client.state.observed.frame_ready = 0;
-		let start = Instant::now();
-		while start.elapsed() < Duration::from_millis(500) {
-			thread::sleep(Duration::from_millis(20));
-			client.roundtrip();
-		}
-		let ready = client.state.observed.frame_ready;
+		let ready = frame_ready_in_500ms(&session, &mut client, mode, name);
 		assert!(
 			(15..=40).contains(&ready),
 			"{name}: {ready} frame_ready in 500 ms, expected one per 60 Hz tick"
 		);
-		swapchain.destroy();
-		surface.destroy();
-		client.roundtrip();
+	}
+	drop(client.conn);
+}
+
+/// Before version 2, `frame_ready` is for FIFO swapchains only: a layer bound
+/// at version 1 gets none for MAILBOX or IMMEDIATE.
+#[test]
+#[ignore = "requires GPU and Xwayland"]
+fn a_version_1_swapchain_gets_frame_ready_for_fifo_only() {
+	let session = Session::start("frame-ready-v1");
+	assert_x11_content(&session);
+
+	let mut client = session.wayland_client_at(1);
+	assert_eq!(wayland_client::Proxy::version(&client.state.ferriscope_factory), 1);
+	let ready = frame_ready_in_500ms(&session, &mut client, 2, "FIFO");
+	assert!(
+		(15..=40).contains(&ready),
+		"FIFO: {ready} frame_ready in 500 ms, expected one per 60 Hz tick"
+	);
+	for (mode, name) in [(1, "MAILBOX"), (0, "IMMEDIATE")] {
+		let ready = frame_ready_in_500ms(&session, &mut client, mode, name);
+		assert_eq!(ready, 0, "{name}: frame_ready sent to a version 1 swapchain");
 	}
 	drop(client.conn);
 }
