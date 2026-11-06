@@ -1,10 +1,18 @@
 //! Xwayland startup and the X11 window-manager handlers.
 
-use std::process::Stdio;
+use std::{
+	os::fd::{AsFd, OwnedFd},
+	process::Stdio,
+	time::{Duration, Instant},
+};
 
 use smithay::{
 	reexports::{
-		calloop::{Interest, Mode, PostAction, generic::Generic},
+		calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
+		rustix::{
+			io::Errno,
+			process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, pidfd_open, pidfd_send_signal, waitid},
+		},
 		wayland_server::protocol::wl_surface::WlSurface,
 	},
 	utils::{Logical, Rectangle},
@@ -50,14 +58,22 @@ impl FerriscopeState {
 		)
 		.map_err(|e| Error::Xwayland(format!("spawn: {e:?}")))?;
 
-		let display_handle = self.display_handle.clone();
-		let loop_handle = self.loop_handle.clone();
+		// The source must not hold the loop's handle or display: the loop owns
+		// the source, so a captured handle would keep the loop, and with it the
+		// Wayland display, the listening socket and the X lock, alive after the
+		// session ends. The callback reaches both through the state.
+		self.xwayland_display = Some(xwayland.display_number());
 		self.loop_handle
 			.insert_source(xwayland, move |event, _, state: &mut Self| match event {
 				XWaylandEvent::Ready {
 					x11_socket,
 					display_number,
-				} => match X11Wm::start_wm(loop_handle.clone(), &display_handle, x11_socket, client.clone()) {
+				} => match X11Wm::start_wm(
+					state.loop_handle.clone(),
+					&state.display_handle,
+					x11_socket,
+					client.clone(),
+				) {
 					Ok(wm) => {
 						tracing::info!(display_number, "Xwayland ready");
 						state.xwm = Some(wm);
@@ -70,15 +86,17 @@ impl FerriscopeState {
 								// connection: gamescope corrects a focus stolen
 								// out of the keyboard-focus window from its
 								// `FocusOut` handler (`steamcompmgr.cpp:8602`).
-								if let Some(fd) = atoms.duplicate_fd()
-									&& let Err(e) = loop_handle.insert_source(
+								if let Some(fd) = atoms.duplicate_fd() {
+									match state.loop_handle.insert_source(
 										Generic::new(fd, Interest::READ, Mode::Level),
 										|_, _, state: &mut Self| {
 											state.poll_x11_events();
 											Ok(PostAction::Continue)
 										},
 									) {
-									tracing::warn!("insert X focus source: {e:?}");
+										Ok(token) => state.x11_focus_source = Some(token),
+										Err(e) => tracing::warn!("insert X focus source: {e:?}"),
+									}
 								}
 								state.focus_control = atoms.read_focus_control();
 								// The WSI layer exposes HDR swapchain formats only when
@@ -120,6 +138,104 @@ impl FerriscopeState {
 			.map_err(|e| Error::Xwayland(format!("insert source: {e:?}")))?;
 
 		Ok(())
+	}
+
+	/// Stop Xwayland at the end of the session: close the classification
+	/// connection, terminate Xwayland, and dispatch the loop until Xwayland is
+	/// reaped and the window manager's connection has closed.
+	///
+	/// smithay's X11 event source keeps a handle to the loop, so the loop
+	/// (with the Wayland display, the listening socket and the X lock it owns)
+	/// can be freed only once that source has seen the connection close and
+	/// removed itself, which drops the window manager
+	/// ([`XwmHandler::disconnected`]). smithay reaps Xwayland once the display
+	/// sees its Wayland connection close. Both need the loop dispatched.
+	pub(in crate::shell) fn stop_xwayland(&mut self, event_loop: &mut EventLoop<'static, Self>) {
+		let Some(x_display) = self.xwayland_display.take() else {
+			return;
+		};
+		if let Some(token) = self.x11_focus_source.take() {
+			self.loop_handle.remove(token);
+		}
+		self.steam = None;
+
+		let xwayland = XwaylandChild::find(x_display);
+		if let Some(child) = &xwayland {
+			child.signal(Signal::TERM);
+		}
+		let mut deadline = Instant::now() + XWAYLAND_EXIT_GRACE;
+		let mut killed = false;
+		loop {
+			let reaped = xwayland.as_ref().is_none_or(XwaylandChild::reaped);
+			if reaped && self.xwm.is_none() {
+				tracing::debug!(x_display, "Xwayland stopped");
+				return;
+			}
+			if Instant::now() >= deadline {
+				if let Some(child) = xwayland.as_ref().filter(|_| !reaped && !killed) {
+					tracing::warn!(x_display, "Xwayland ignored SIGTERM; killing it");
+					child.signal(Signal::KILL);
+					killed = true;
+					deadline = Instant::now() + XWAYLAND_EXIT_GRACE;
+					continue;
+				}
+				tracing::warn!(
+					x_display,
+					reaped,
+					wm_connected = self.xwm.is_some(),
+					"Xwayland did not stop in time"
+				);
+				self.xwm = None;
+				return;
+			}
+			if let Err(e) = event_loop.dispatch(Some(TEARDOWN_TICK), self) {
+				tracing::warn!("dispatch while stopping Xwayland: {e:?}");
+				self.xwm = None;
+				return;
+			}
+		}
+	}
+}
+
+/// How long Xwayland gets to exit after a signal before the next step.
+const XWAYLAND_EXIT_GRACE: Duration = Duration::from_secs(2);
+/// The longest one dispatch waits while Xwayland stops.
+const TEARDOWN_TICK: Duration = Duration::from_millis(10);
+
+/// The session's Xwayland process, pinned by a pidfd so a signal never
+/// reaches a process that reused its pid.
+struct XwaylandChild {
+	pid: u32,
+	pidfd: OwnedFd,
+}
+
+impl XwaylandChild {
+	/// The live or unreaped Xwayland this process started for `display`.
+	fn find(display: u32) -> Option<Self> {
+		let pid = crate::process::xwayland_child(display)?;
+		let pidfd = match pidfd_open(Pid::from_raw(pid as i32)?, PidfdFlags::empty()) {
+			Ok(pidfd) => pidfd,
+			Err(e) => {
+				tracing::warn!(pid, "pidfd_open Xwayland: {e}");
+				return None;
+			},
+		};
+		let child = Self { pid, pidfd };
+		// The pid may have been reaped and reused before the pidfd pinned it.
+		(!child.reaped()).then_some(child)
+	}
+
+	fn signal(&self, signal: Signal) {
+		if let Err(e) = pidfd_send_signal(&self.pidfd, signal) {
+			tracing::debug!(pid = self.pid, "signal Xwayland: {e}");
+		}
+	}
+
+	/// Whether it has been reaped (by smithay, once the display has seen its
+	/// Wayland connection close), not merely exited: a zombie still counts.
+	fn reaped(&self) -> bool {
+		let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+		matches!(waitid(WaitId::PidFd(self.pidfd.as_fd()), options), Err(Errno::CHILD))
 	}
 }
 
