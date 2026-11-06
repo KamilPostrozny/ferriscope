@@ -212,6 +212,8 @@ pub struct FerriscopeState {
 	/// `None` when Xwayland is off or the connection failed; classification then
 	/// degrades to the plain ICCCM rule.
 	steam: Option<SteamAtoms>,
+	/// The loop source watching the Steam atom connection for focus escapes.
+	x11_focus_source: Option<RegistrationToken>,
 	/// Active pointer capture (lock/confine) for the focused window.
 	capture: PointerCapture,
 	/// The surface the active capture belongs to, if any.
@@ -286,6 +288,9 @@ pub struct FerriscopeState {
 	/// External stop request from [`crate::compositor::Compositor::stop`].
 	external_stop: Arc<AtomicBool>,
 	xwm: Option<X11Wm>,
+	/// The X display number of the session's Xwayland, from its spawn until
+	/// [`Self::stop_xwayland`].
+	xwayland_display: Option<u32>,
 	/// The `gamescope_action_binding_manager` global Steam binds its keyboard
 	/// hotkeys to. Kept so the global lives as
 	/// long as the compositor.
@@ -367,13 +372,13 @@ pub(crate) fn serve(config: CompositorConfig, endpoints: Endpoints) -> Result<()
 		state.spawn_app(&argv, None)?;
 	}
 
-	event_loop
+	let result = event_loop
 		.run(Some(Duration::from_millis(50)), &mut state, |state| {
 			state.post_dispatch()
 		})
-		.map_err(|e| Error::Wayland(format!("dispatch: {e:?}")))?;
-
-	Ok(())
+		.map_err(|e| Error::Wayland(format!("dispatch: {e:?}")));
+	state.tear_down(&mut event_loop);
+	result
 }
 
 impl FerriscopeState {
@@ -594,6 +599,7 @@ impl FerriscopeState {
 			focus_dirty: FocusDirty::new(),
 			overlays: Vec::new(),
 			steam: None,
+			x11_focus_source: None,
 			capture: PointerCapture::None,
 			capture_surface: None,
 			cursor_position_hint: None,
@@ -637,6 +643,7 @@ impl FerriscopeState {
 			hdr: config_hdr,
 			external_stop: stop,
 			xwm: None,
+			xwayland_display: None,
 			action_binding_global,
 			_swapchain_globals: swapchain_globals,
 			swapchain_factories: FactoryRegistry::default(),
@@ -820,6 +827,18 @@ impl FerriscopeState {
 	fn request_stop(&mut self) {
 		self.loop_signal.stop();
 		self.loop_signal.wakeup();
+	}
+
+	/// Release what the session started, before the event loop is dropped:
+	/// the frame timer, the hosted application and Xwayland. Once this returns
+	/// no source holds the loop's handle, so dropping the loop frees the
+	/// Wayland display, its listening socket and the X lock.
+	fn tear_down(&mut self, event_loop: &mut EventLoop<'static, Self>) {
+		if let Some((token, _)) = self.timer.take() {
+			self.loop_handle.remove(token);
+		}
+		self.terminate_child();
+		self.stop_xwayland(event_loop);
 	}
 
 	/// Fire the one-shot readiness handshake, if a consumer is waiting.
