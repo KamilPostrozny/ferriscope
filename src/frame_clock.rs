@@ -185,10 +185,14 @@ impl FrameClockCommand {
 	}
 }
 
+/// The rate of a session configured at `rate` Hz, as the scheduler takes it.
+pub(crate) fn session_rate(rate: f64) -> f64 {
+	if rate.is_finite() { rate.max(1.0) } else { 60.0 }
+}
+
 /// The nominal period of a session at `rate` Hz, as the scheduler takes it.
 pub(crate) fn nominal_period(rate: f64) -> Duration {
-	let rate = if rate.is_finite() { rate.max(1.0) } else { 60.0 };
-	Duration::from_secs_f64(1.0 / rate)
+	Duration::from_secs_f64(1.0 / session_rate(rate))
 }
 
 #[cfg(test)]

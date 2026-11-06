@@ -37,7 +37,9 @@ use smithay::{
 };
 
 use crate::{
-	frame_clock::{CORRECTION_TIMEOUT, FrameClockCorrection, MAX_PHASE_STEP, max_phase_shift_ns, nominal_period},
+	frame_clock::{
+		CORRECTION_TIMEOUT, FrameClockCorrection, MAX_PHASE_STEP, max_phase_shift_ns, nominal_period, session_rate,
+	},
 	shell::{FerriscopeState, render::RenderOutcome},
 };
 
@@ -101,6 +103,8 @@ pub(in crate::shell) struct Scheduler {
 	/// The nominal interval (`1 / rate`), which the clock goes back to when
 	/// corrections stop.
 	nominal: Duration,
+	/// The nominal rate (`1 / nominal`), in Hz.
+	rate: f64,
 	/// Phase shift still to apply to the frame-callback grid, in nanoseconds
 	/// (positive: later); at most [`MAX_PHASE_STEP`] per callback.
 	pending_shift_ns: i64,
@@ -163,6 +167,7 @@ impl Scheduler {
 		Self {
 			interval,
 			nominal: interval,
+			rate: session_rate(rate),
 			pending_shift_ns: 0,
 			last_correction: None,
 			commit_epoch: 0,
@@ -185,6 +190,12 @@ impl Scheduler {
 	/// The session interval: the frame clock's current period.
 	pub(in crate::shell) fn interval(&self) -> Duration {
 		self.interval
+	}
+
+	/// The cycle of a `GAMESCOPE_FPS_LIMIT` of `limit_hz`, in session ticks;
+	/// `None` when there is no limit (zero).
+	pub(in crate::shell) fn fps_limit_cycle(&self, limit_hz: u32) -> Option<f64> {
+		(limit_hz != 0).then(|| self.rate / f64::from(limit_hz))
 	}
 
 	/// Apply an embedder's frame-clock correction at `now` (already checked
@@ -388,12 +399,6 @@ impl Scheduler {
 	}
 }
 
-/// Slack on the FPS-limit schedule: gamescope's 0.2 ms (`steamcompmgr.cpp:6743`:
-/// `now + 200'000ull < ulSchedule`) plus one phase step, since a steered grid
-/// may bring a tick that much earlier. Without it a cap at the session rate
-/// would skip a callback on every negative step.
-const FPS_LIMIT_FUDGE: Duration = Duration::from_micros(200).saturating_add(MAX_PHASE_STEP);
-
 /// Whether the FPS limiter covers a window (`steamcompmgr_window_should_limit_fps`,
 /// `steamcompmgr.cpp:1475`): the Steam UI and the overlays are exempt
 /// (`window_is_limiter_exempt`, `:1303`). The VR-scene exemptions have no
@@ -403,18 +408,48 @@ pub(in crate::shell) fn limiter_covers(meta: &crate::focus::WindowMeta) -> bool 
 	!(steam || meta.is_overlay || meta.is_external_overlay)
 }
 
-/// Whether a window covered by an `limit_hz` cap may receive frame callbacks at
-/// `now`, given when it last received requested ones (`steamcompmgr.cpp:6736-6744`:
-/// the next callback is due one target cycle after the last).
-pub(in crate::shell) fn frame_callback_due(limit_hz: u32, last: Option<Instant>, now: Instant) -> bool {
-	if limit_hz == 0 {
-		return true;
+/// Float slack on the FPS-limit schedule, in ticks: a cycle that is a whole
+/// number of ticks is due on that tick even when the sum of cycles rounds a
+/// hair above it.
+const FPS_LIMIT_EPSILON: f64 = 1e-6;
+
+/// A window's place on the `GAMESCOPE_FPS_LIMIT` schedule.
+///
+/// gamescope sends a covered window its next frame callbacks one target cycle
+/// of wall time after the last requested ones, less 0.2 ms
+/// (`steamcompmgr.cpp:6736-6744`), on a fixed vblank. Here ticks are steered
+/// (a period up to 1% shorter, a tick up to one phase step earlier), so a wall
+/// time slack big enough for that would let every cap within it of the session
+/// rate through on every tick. The schedule counts session ticks instead,
+/// which steering does not change: a cap at the session rate or above passes
+/// every tick, one at half of it every second tick, and one just under it
+/// (118 fps on a 120 Hz session) skips a tick as often as averaging the cap
+/// needs.
+#[derive(Debug, Default, Clone, Copy)]
+pub(in crate::shell) struct FpsLimit {
+	/// Ticks until the window may receive requested frame callbacks again; due
+	/// at zero or less.
+	wait: f64,
+}
+
+impl FpsLimit {
+	/// Advance one session tick; whether the window may receive frame
+	/// callbacks on it.
+	pub(in crate::shell) fn tick(&mut self) -> bool {
+		self.wait -= 1.0;
+		self.wait <= FPS_LIMIT_EPSILON
 	}
-	let Some(last) = last else {
-		return true;
-	};
-	let cycle = Duration::from_secs_f64(1.0 / f64::from(limit_hz));
-	now + FPS_LIMIT_FUDGE >= last + cycle
+
+	/// Record that the window received requested frame callbacks on this tick,
+	/// under a cap of `cycle` ticks ([`Scheduler::fps_limit_cycle`]).
+	///
+	/// Less than a tick past due is where the cycle fell between two ticks:
+	/// it carries over, so the window averages the cap. More means the window
+	/// requested nothing on a due tick, so the cycle starts over, as
+	/// gamescope's does from the last requested callbacks.
+	pub(in crate::shell) fn sent(&mut self, cycle: f64) {
+		self.wait = if self.wait > -1.0 { self.wait + cycle } else { cycle };
+	}
 }
 
 impl FerriscopeState {
@@ -959,56 +994,85 @@ mod tests {
 	}
 
 	#[test]
-	fn no_limit_or_no_history_always_sends_callbacks() {
-		let t0 = Instant::now();
-		assert!(frame_callback_due(0, Some(t0), t0));
-		assert!(frame_callback_due(30, None, t0));
+	fn no_limit_has_no_cycle() {
+		let (s, _) = scheduler();
+		assert_eq!(s.fps_limit_cycle(0), None);
+		assert_eq!(s.fps_limit_cycle(50), Some(2.0));
 	}
 
 	#[test]
-	fn a_limit_spaces_callbacks_by_one_target_cycle() {
-		let t0 = Instant::now();
-		// 30 Hz: one callback per 33.3 ms.
-		assert!(!frame_callback_due(30, Some(t0), t0 + ms(16)));
-		assert!(frame_callback_due(30, Some(t0), t0 + ms(34)));
-		// Within the fudge of the schedule counts as due.
-		assert!(frame_callback_due(30, Some(t0), t0 + Duration::from_micros(33_200)));
+	fn the_limit_cycle_ignores_frame_clock_corrections() {
+		// The grid steered as far as it may: the period 1% shorter, a phase shift
+		// pending. The cycle is in ticks, so it stays put.
+		let (mut s, t0) = scheduler();
+		s.correct(correction(INTERVAL - INTERVAL / 100, -5000), t0);
+		assert_eq!(s.fps_limit_cycle(RATE as u32), Some(1.0));
 	}
 
-	#[test]
-	fn a_limit_on_a_session_rate_tick_halves_the_rate() {
-		// 60 Hz ticks, 30 Hz limit: every second tick passes.
-		let t0 = Instant::now();
-		let tick = Duration::from_secs_f64(1.0 / 60.0);
-		let mut last = None;
-		let mut sent = 0;
-		for n in 0..60u32 {
-			let now = t0 + tick * n;
-			if frame_callback_due(30, last, now) {
-				last = Some(now);
-				sent += 1;
+	/// The ticks, of the first `ticks` of a `rate` Hz session under a `limit_hz`
+	/// cap, on which a window requesting callbacks on every tick in `requests`
+	/// receives them.
+	fn limited_ticks(rate: f64, limit_hz: u32, ticks: u32, requests: impl Fn(u32) -> bool) -> Vec<u32> {
+		let cycle = Scheduler::new(rate, Instant::now()).fps_limit_cycle(limit_hz).unwrap();
+		let mut limit = FpsLimit::default();
+		let mut sent = Vec::new();
+		for n in 0..ticks {
+			if limit.tick() && requests(n) {
+				limit.sent(cycle);
+				sent.push(n);
 			}
 		}
-		assert_eq!(sent, 30);
+		sent
 	}
 
 	#[test]
-	fn a_limit_at_the_session_rate_passes_every_steered_tick() {
-		// 120 Hz ticks, 120 Hz limit, on a grid a correction shortened as far as it
-		// may: the period by 1% and each tick by a whole phase step.
-		let t0 = Instant::now();
-		let cycle = Duration::from_secs_f64(1.0 / 120.0);
-		let tick = cycle - cycle / 100 - MAX_PHASE_STEP;
-		let mut last = None;
-		let mut sent = 0;
-		for n in 0..120u32 {
-			let now = t0 + tick * n;
-			if frame_callback_due(120, last, now) {
-				last = Some(now);
-				sent += 1;
-			}
+	fn a_limit_at_the_session_rate_passes_every_tick() {
+		for rate in [30, 60, 120] {
+			let sent = limited_ticks(f64::from(rate), rate, 10 * rate, |_| true);
+			assert_eq!(sent.len(), 10 * rate as usize, "{rate} Hz");
 		}
-		assert_eq!(sent, 120);
+	}
+
+	#[test]
+	fn a_limit_above_the_session_rate_passes_every_tick() {
+		assert_eq!(limited_ticks(60.0, 144, 600, |_| true).len(), 600);
+	}
+
+	#[test]
+	fn a_limit_at_half_the_session_rate_passes_every_second_tick() {
+		for rate in [30, 60, 120] {
+			let sent = limited_ticks(f64::from(rate), rate / 2, 10 * rate, |_| true);
+			assert_eq!(sent, (0..10 * rate).step_by(2).collect::<Vec<_>>(), "{rate} Hz");
+		}
+	}
+
+	#[test]
+	fn a_fractional_cycle_repeats_its_pattern_exactly() {
+		// 50 fps on 120 Hz: 2.4 ticks a cycle, five callbacks in every 12 ticks,
+		// although five cycles sum to 12 ticks only up to float rounding.
+		let sent = limited_ticks(120.0, 50, 1200, |_| true);
+		assert_eq!(sent.len(), 500);
+		for (n, chunk) in sent.chunks(5).enumerate() {
+			let base = 12 * n as u32;
+			assert_eq!(chunk, [0, 3, 5, 8, 10].map(|tick| base + tick), "cycle {n}");
+		}
+	}
+
+	#[test]
+	fn a_limit_just_under_the_session_rate_is_enforced() {
+		// 118 fps on a 120 Hz session: the window skips two ticks in every 120,
+		// never two in a row.
+		let sent = limited_ticks(120.0, 118, 1200, |_| true);
+		assert_eq!(sent.len(), 1180);
+		assert!(sent.windows(2).all(|pair| pair[1] - pair[0] <= 2));
+	}
+
+	#[test]
+	fn a_window_that_requested_nothing_starts_a_fresh_cycle() {
+		// 30 fps on 60 Hz: idle from tick 1 to 10, the window is served on the
+		// first tick it asks again, then one cycle later, not on the next tick.
+		let sent = limited_ticks(60.0, 30, 16, |n| n == 0 || n > 10);
+		assert_eq!(sent, vec![0, 11, 13, 15]);
 	}
 
 	#[test]

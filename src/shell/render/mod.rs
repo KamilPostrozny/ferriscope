@@ -476,25 +476,22 @@ impl FerriscopeState {
 		unreachable!("a DMA-BUF-only build always renders into the pool");
 	}
 
-	/// Send frame callbacks to every tracked window.
+	/// Send frame callbacks to every tracked window, on a session tick.
 	///
 	/// With a `GAMESCOPE_FPS_LIMIT`, a window the limiter covers receives them
-	/// only once its target cycle has elapsed since it last received requested
-	/// ones (`steamcompmgr_should_vblank_window`, `steamcompmgr.cpp:6736`).
+	/// only on the ticks its [`FpsLimit`](crate::shell::schedule::FpsLimit)
+	/// schedule allows (`steamcompmgr_should_vblank_window`, `steamcompmgr.cpp:6736`).
 	pub(in crate::shell) fn send_frame_callbacks(&mut self) -> Vec<WlSurface> {
-		let now = Instant::now();
 		let time = self.start_time.elapsed();
 		let output = &self.output;
-		let limit = self.fps_limit;
+		let cycle = self.scheduler.fps_limit_cycle(self.fps_limit);
 		let mut ticked = Vec::new();
 		// Every tracked window gets callbacks, not only the drawn ones: like
 		// gamescope, a window behind the focus window or an overlay waiting to be
 		// shown keeps running so it can present as soon as it is picked.
 		for managed in self.windows.iter_mut() {
-			if limit != 0
-				&& crate::shell::schedule::limiter_covers(&managed.meta)
-				&& !crate::shell::schedule::frame_callback_due(limit, managed.last_frame_done, now)
-			{
+			let limited = cycle.filter(|_| crate::shell::schedule::limiter_covers(&managed.meta));
+			if limited.is_some() && !managed.fps_limit.tick() {
 				continue;
 			}
 			// The window's own surface and the WSI layer's override surface share
@@ -504,12 +501,12 @@ impl FerriscopeState {
 			let surfaces: Vec<WlSurface> = main.into_iter().chain(content_override.clone()).collect();
 			// A FIFO barrier is released on this tick too, so it paces the
 			// window exactly like a frame callback does.
-			if limit != 0
+			if let Some(cycle) = limited
 				&& surfaces
 					.iter()
 					.any(|surface| has_frame_callbacks(surface) || crate::shell::fifo::has_fifo_barrier(surface))
 			{
-				managed.last_frame_done = Some(now);
+				managed.fps_limit.sent(cycle);
 			}
 			managed
 				.window

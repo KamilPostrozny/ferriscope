@@ -17,7 +17,7 @@
 //! | commit | `has_commits`, `damage_seq` |
 //! | unmap / destroy / client gone | the entry is dropped |
 
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
 
 use smithay::{
 	desktop::Window,
@@ -36,15 +36,16 @@ use crate::{
 
 use crate::shell::FerriscopeState;
 use crate::shell::geometry::{root_surface, window_wl_surface};
+use crate::shell::schedule::FpsLimit;
 
 /// One tracked window: the smithay handle plus its cached metadata.
 pub(in crate::shell) struct ManagedWindow {
 	pub window: Window,
 	pub meta: WindowMeta,
-	/// When the window last received frame callbacks that it had requested
-	/// (`last_commit_first_latch_time`, `steamcompmgr.cpp:6686`), the base of the
-	/// FPS-limit schedule.
-	pub last_frame_done: Option<Instant>,
+	/// The window's place on the FPS-limit schedule, from the requested frame
+	/// callbacks it last received (`last_commit_first_latch_time`,
+	/// `steamcompmgr.cpp:6686`).
+	pub fps_limit: FpsLimit,
 }
 
 /// Every tracked window, keyed by [`WindowId`], with gamescope's list order.
@@ -74,7 +75,7 @@ impl WindowTable {
 			ManagedWindow {
 				window,
 				meta,
-				last_frame_done: None,
+				fps_limit: FpsLimit::default(),
 			},
 		);
 	}
@@ -92,7 +93,7 @@ impl WindowTable {
 			ManagedWindow {
 				window,
 				meta,
-				last_frame_done: None,
+				fps_limit: FpsLimit::default(),
 			},
 		);
 		id
