@@ -239,6 +239,13 @@ impl Scheduler {
 		self.last_correction.is_some()
 	}
 
+	/// A new consumer steers from `now`: back to the nominal period, dropping
+	/// any phase shift not yet applied, so it does not start on the last
+	/// consumer's steering.
+	pub(in crate::shell) fn new_consumer(&mut self, now: Instant) {
+		self.go_nominal(now);
+	}
+
 	/// Go back to the nominal period, dropping any phase shift not yet applied,
 	/// once no correction has arrived for [`CORRECTION_TIMEOUT`].
 	fn expire_correction(&mut self, now: Instant) {
@@ -246,12 +253,17 @@ impl Scheduler {
 			.last_correction
 			.is_some_and(|at| now.saturating_duration_since(at) >= CORRECTION_TIMEOUT)
 		{
-			self.tokens = self.tokens_at(now);
-			self.last_refill = now;
-			self.interval = self.nominal;
-			self.pending_shift_ns = 0;
-			self.last_correction = None;
+			self.go_nominal(now);
 		}
+	}
+
+	fn go_nominal(&mut self, now: Instant) {
+		// Refill at the period the tokens had so far.
+		self.tokens = self.tokens_at(now);
+		self.last_refill = now;
+		self.interval = self.nominal;
+		self.pending_shift_ns = 0;
+		self.last_correction = None;
 	}
 
 	/// Record one surface commit.
@@ -588,6 +600,15 @@ impl FerriscopeState {
 			"frame clock correction"
 		);
 		self.scheduler.correct(correction, Instant::now());
+	}
+
+	/// A new consumer steers the frame clock from here (see
+	/// [`crate::FrameClockSender::new_consumer`]).
+	pub(in crate::shell) fn new_frame_clock_consumer(&mut self) {
+		if self.scheduler.steered() {
+			tracing::info!("frame clock: new consumer; back to the nominal period");
+		}
+		self.scheduler.new_consumer(Instant::now());
 	}
 
 	/// The timer fired: the housekeeping and frame callbacks that run at the
@@ -1388,6 +1409,27 @@ mod tests {
 			spacings_us(&commits[after..]).iter().all(|spacing| *spacing == 10_000),
 			"{:?}",
 			spacings_us(&commits[after..])
+		);
+	}
+
+	#[test]
+	fn a_new_consumer_starts_at_the_nominal_period_with_no_shift_pending() {
+		let (mut s, t0) = scheduler();
+		let before = commits_on_the_tick(&mut s, t0, t0 + ms(30));
+		let now = *before.last().unwrap();
+		// The last consumer's slower period and a 5 ms shift, two frames into
+		// applying it.
+		s.correct(correction(Duration::from_micros(10_080), 5_000), now);
+		let steered = commits_on_the_tick(&mut s, now, now + ms(25));
+		let now = *steered.last().unwrap();
+		s.new_consumer(now);
+		assert!(!s.steered());
+		assert_eq!(s.interval(), INTERVAL);
+		let after = commits_on_the_tick(&mut s, now, now + ms(200));
+		assert!(
+			spacings_us(&after).iter().all(|spacing| *spacing == 10_000),
+			"{:?}",
+			spacings_us(&after)
 		);
 	}
 
