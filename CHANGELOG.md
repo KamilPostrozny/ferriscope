@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CompositorHandles::frame_clock`: an embedder steers the frame-callback grid with bounded `FrameClockCorrection`s (a period within 1% of nominal and a relative phase shift of at most half a period, applied at most 250 µs per frame). Without a correction for one second the grid goes back to the nominal period.
 - `ferriscope-wsi` holds an application at the end of `vkQueuePresentKHR` until the compositor's next tick in every present mode, not only FIFO: a game with VSync off (MAILBOX, IMMEDIATE) renders one frame per tick on the steered frame clock instead of unbounded. `FERRISCOPE_WSI_HOLD=fifo` holds FIFO only (the old behaviour), `FERRISCOPE_WSI_HOLD=off` nothing. `ferriscope_swapchain_v1` version 2 sends `frame_ready` at every tick for non-FIFO swapchains bound at version 2 (one bound at version 1 gets it for FIFO only); the layer holds those only on a version 2 compositor.
 
+### Changed
+
+- `tools/install-wsi.sh` builds and installs the layer for i686 too (`lib32/ferriscope/libferriscope_wsi.so`, `VkLayer_FERRISCOPE_wsi.i686.json`), so 32-bit Vulkan games and 32-bit DXVK/vkd3d-proton take the Xwayland bypass, HDR and the present hold. It fails, before installing anything, when the `i686-unknown-linux-gnu` Rust target or a 32-bit C toolchain is missing.
+
 ### Removed
 
 - `FERRISCOPE_WSI_PACING`: `FERRISCOPE_WSI_HOLD` replaces it.

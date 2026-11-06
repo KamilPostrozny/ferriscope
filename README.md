@@ -16,7 +16,7 @@ There is no display, no modeset and no scanout, and no vblank. The session rate
 | Crate | Contents |
 |---|---|
 | `ferriscope` | The library (compositor, frame delivery, focus, Steam, Wayland and X11 handlers) and the thin `ferriscope` binary (command line and logging). Embedders use `default-features = false` to skip the binary's dependencies. |
-| `ferriscope-wsi` | The Vulkan WSI layer `VK_LAYER_FERRISCOPE_wsi` (x86_64). |
+| `ferriscope-wsi` | The Vulkan WSI layer `VK_LAYER_FERRISCOPE_wsi` (x86_64 and i686). |
 
 ## Features
 
@@ -54,7 +54,11 @@ There is no display, no modeset and no scanout, and no vblank. The session rate
 ```sh
 cargo build --workspace
 cargo test --workspace                  # unit tests, no GPU needed
+cargo test -p ferriscope-wsi --target i686-unknown-linux-gnu   # the 32-bit layer
 ```
+
+The 32-bit layer needs the `i686-unknown-linux-gnu` Rust target and a 32-bit
+glibc (`cc -m32`; on Arch `lib32-rust-libs` and `lib32-glibc`).
 
 The integration suite needs a GPU, Xwayland and the DRM render node. It is
 `#[ignore]`d, so run it explicitly:
@@ -70,6 +74,9 @@ Minimum Rust version 1.87.
 ```sh
 tools/install-wsi.sh --prefix /usr         # run as yourself; sudo is used only to install
 ```
+
+It installs the x86_64 layer under `lib/` and the i686 one under `lib32/`,
+each with its own manifest, and fails without the i686 toolchain.
 
 ## Library use
 

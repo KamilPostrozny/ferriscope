@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Build and install the ferriscope Vulkan WSI layer.
+# Build and install the ferriscope Vulkan WSI layer, 64-bit and 32-bit.
 #
 #   tools/install-wsi.sh [--prefix PREFIX] [--profile release|debug]
 #
 # Installs, under PREFIX (default /usr/local; DESTDIR is honoured):
-#   lib/ferriscope/libferriscope_wsi.so
+#   lib/ferriscope/libferriscope_wsi.so                         (x86_64)
+#   lib32/ferriscope/libferriscope_wsi.so                       (i686)
 #   share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
+#   share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.i686.json
 #
-# The manifest carries the final library path (PREFIX, without DESTDIR). The
-# layer is enabled by ENABLE_FERRISCOPE_WSI=1 and disabled by
-# DISABLE_FERRISCOPE_WSI=1. Only x86_64 is built: a 32-bit game skips the
-# layer and presents through Xwayland, as it does under gamescope.
+# Each manifest carries its final library path (PREFIX, without DESTDIR); the
+# Vulkan loader picks the one whose library matches the game's architecture.
+# The layer is enabled by ENABLE_FERRISCOPE_WSI=1 and disabled by
+# DISABLE_FERRISCOPE_WSI=1.
+#
+# The 32-bit layer (32-bit Vulkan games, 32-bit DXVK/vkd3d-proton) needs the
+# i686-unknown-linux-gnu Rust target and a 32-bit C toolchain (cc -m32 with
+# lib32 glibc; on Arch: lib32-rust-libs and lib32-glibc). Without them the
+# script fails before installing anything.
 #
 # The build goes to CARGO_TARGET_DIR when it is set, and to the workspace's
 # target/ otherwise.
@@ -60,18 +67,31 @@ else
 	as_installer() { sudo "$@"; }
 fi
 
-# Build first, as the invoking user, so a build failure installs nothing and
-# sudo is only asked for once the layer exists.
-echo "building ferriscope-wsi" >&2
-(cd "$root" && CARGO_TARGET_DIR=$target_dir cargo build -p ferriscope-wsi "${cargo_profile[@]}")
+# The 32-bit layer is required: check its toolchain before building anything.
+i686=i686-unknown-linux-gnu
+if [ ! -d "$(rustc --print sysroot)/lib/rustlib/$i686/lib" ]; then
+	echo "the Rust target $i686 is missing (Arch: lib32-rust-libs; rustup: rustup target add $i686)" >&2
+	exit 1
+fi
+if ! printf 'int main(void) { return 0; }\n' | cc -m32 -x c - -o /dev/null 2>/dev/null; then
+	echo "cc -m32 cannot link a 32-bit program; install a 32-bit glibc (Arch: lib32-glibc, Debian: gcc-multilib)" >&2
+	exit 1
+fi
 
-built=$target_dir/$profile/libferriscope_wsi.so
-library=$prefix/lib/ferriscope/libferriscope_wsi.so
+# Build both first, as the invoking user, so a build failure installs nothing
+# and sudo is only asked for once the layers exist.
+echo "building ferriscope-wsi (x86_64, i686)" >&2
+(cd "$root" && CARGO_TARGET_DIR=$target_dir cargo build -p ferriscope-wsi "${cargo_profile[@]}")
+(cd "$root" && CARGO_TARGET_DIR=$target_dir cargo build -p ferriscope-wsi --target "$i686" "${cargo_profile[@]}")
+
 manifest_dir=$destdir$prefix/share/vulkan/implicit_layer.d
-as_installer install -Dm755 "$built" "$destdir$library"
-sed -e "s|@ARCH@|x86_64|g" -e "s|@LIBRARY_PATH@|$library|g" "$template" |
-	as_installer install -Dm644 /dev/stdin "$manifest_dir/VkLayer_FERRISCOPE_wsi.x86_64.json"
-# What an install before x86_64-only builds left behind: the i386 layer.
-as_installer rm -f "$destdir$prefix/lib32/ferriscope/libferriscope_wsi.so" \
-	"$manifest_dir/VkLayer_FERRISCOPE_wsi.i686.json"
-echo "installed $destdir$library" >&2
+# install_layer ARCH BUILT LIBDIR
+install_layer() {
+	local library=$prefix/$3/ferriscope/libferriscope_wsi.so
+	as_installer install -Dm755 "$2" "$destdir$library"
+	sed -e "s|@ARCH@|$1|g" -e "s|@LIBRARY_PATH@|$library|g" "$template" |
+		as_installer install -Dm644 /dev/stdin "$manifest_dir/VkLayer_FERRISCOPE_wsi.$1.json"
+	echo "installed $destdir$library" >&2
+}
+install_layer x86_64 "$target_dir/$profile/libferriscope_wsi.so" lib
+install_layer i686 "$target_dir/$i686/$profile/libferriscope_wsi.so" lib32
