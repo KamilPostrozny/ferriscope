@@ -185,6 +185,15 @@ impl FerriscopeState {
 					wm_connected = self.xwm.is_some(),
 					"Xwayland did not stop in time"
 				);
+				// Give up without waiting any longer. Dropping smithay's
+				// `X11Source` joins its event thread with no time limit, but
+				// nothing drops it here: it stays registered in the loop, whose
+				// handle its callback holds, so the loop (display, socket, X
+				// lock) leaks and the thread stays blocked on the connection.
+				// That happens only when Xwayland outlives SIGKILL (stuck in the
+				// kernel) or its connection outlives Xwayland. On every other
+				// path the source drops itself only after its thread exited on
+				// the closed connection, so that join returns at once.
 				self.xwm = None;
 				return;
 			}
